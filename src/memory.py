@@ -19,6 +19,11 @@ from __future__ import annotations
 from collections import Counter
 from math import sqrt
 
+try:
+    from .float_compare import lt
+except ImportError:  # Supports direct imports from src/.
+    from float_compare import lt
+
 # Cosine floor for calling two incidents "similar". With the weights below this
 # effectively requires method, route, and failure reason to all agree; a single
 # categorical mismatch lands around 0.69.
@@ -132,7 +137,7 @@ class IncidentMemory:
         # Reversed + a stable sort means ties resolve to the most recent precedent.
         for entry in reversed(self._entries):
             similarity = round(cosine_similarity(vector, entry["vector"]), 3)
-            if similarity < self.threshold:
+            if lt(similarity, self.threshold):
                 continue
             scored.append(
                 {

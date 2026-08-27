@@ -41,6 +41,7 @@ src/recovery.py    one primary action, hard bounds, route-health gate, audit
 src/pipeline.py    end-to-end record construction and evidence timeline
 src/evaluate.py    full-dataset metrics, exceptions, and results.json
 src/config.py      reviewable recovery policy knobs and modeling assumption
+src/float_compare.py  decimal-sense comparisons for policy thresholds
 src/api.py         live incident, detail, summary, simulation, and health APIs
 src/run_demo.py    regenerate, evaluate, and serve the demo in one command
 src/razorpay_integration.py  capped/throttled TEST MODE SDK adapter
@@ -158,18 +159,20 @@ These values come from the checked-in deterministic run of all 60 incidents (51 
 
 | Metric | Full-dataset result |
 |---|---:|
-| Pair-level detection accuracy | 98.3% |
-| Root-cause accuracy on clear cases | 98.0% |
+| Pair-level detection accuracy | 100.0% |
+| Root-cause accuracy on clear cases | 100.0% |
 | Honesty rate on ambiguous cases | 100.0% |
 | Attempted GMV | INR 155,581,716 |
 | Failed GMV | INR 21,108,516 |
 | Recoverable GMV | INR 6,787,322 |
 | Modeled recovered amount | INR 2,375,563 |
 | Recovery-rate basis | **35% modeling assumption; not measured** |
-| Incident escalations | 10 |
-| Misdiagnoses | 1 |
+| Incident escalations | 9 |
+| Misdiagnoses | 0 |
 
-Nothing is cherry-picked. Generated `results.json` contains all 60 pipeline records, their evidence and audit trails, plus the complete exception list. It is ignored by Git and regenerated on every demo boot. The one missed diagnosis is retained: a mild incident's observed rate drop rounded below the explicit detector threshold, so it remained unresolved.
+Nothing is cherry-picked. Generated `results.json` contains all 60 pipeline records, their evidence and audit trails, plus the complete exception list. It is ignored by Git and regenerated on every demo boot.
+
+The previously documented miss (INC-0045, 98.3% detection / 1 misdiagnosis) was a floating-point defect, not a tuning choice. Its true success-rate drop is exactly `0.05`, but `0.97 - 0.92` evaluates to `0.04999999999999993` in binary floating point, so it fell a few ULPs under a `>= 0.05` gate and was rejected. Threshold comparisons now go through `src/float_compare.py`, which compares in decimal terms. See `tests/test_float_precision.py`.
 
 ## Sample RCA output
 

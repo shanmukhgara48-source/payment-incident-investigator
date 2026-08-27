@@ -10,8 +10,10 @@ from __future__ import annotations
 
 try:
     from .correlator import ERROR_SIGNATURES
+    from .float_compare import gte, lt
 except ImportError:
     from correlator import ERROR_SIGNATURES
+    from float_compare import gte, lt
 
 # ── penalty schedule ────────────────────────────────────────────────
 # Each rule that fires returns a tuple (challenge_text, penalty).
@@ -103,7 +105,7 @@ def _rule_low_failure_concentration(
     if predicted_cause == "unresolved":
         return None
     concentration = evidence.get("concentration_pct", 100)
-    if concentration < 80:
+    if lt(concentration, 80):
         penalty = round(0.04 + 0.06 * ((80 - concentration) / 80), 3)
         return (
             f"Failure concentration is only {concentration:.1f}% — "
@@ -130,7 +132,10 @@ def _rule_thin_margin_over_runner_up(
     if len(sorted_vals) < 2:
         return None
     margin = sorted_vals[0] - sorted_vals[1]
-    if 0.15 <= margin < 0.30:
+    # `margin` is a difference of two accumulated float scores, so both ends of
+    # this band need decimal-sense comparisons or a margin of exactly 0.15 or
+    # 0.30 can fall on the wrong side of the rule.
+    if gte(margin, 0.15) and lt(margin, 0.30):
         return (
             f"Margin over the next-best explanation is only {margin:.2f} — "
             "an alternative cause is almost as well-supported.",
@@ -195,7 +200,11 @@ def skeptic_review(
     total_penalty = round(total_penalty, 3)
     final_confidence = round(max(0.0, primary_confidence - total_penalty), 2)
 
-    # Hard invariant: skeptic can only hold or lower confidence
+    # Hard invariant: skeptic can only hold or lower confidence.
+    # This comparison is deliberately exact, NOT tolerance-based. It is a clamp,
+    # not a policy threshold: a tolerant `gt` would treat a tiny excess as equal
+    # and skip the clamp, leaving final_confidence above primary_confidence and
+    # violating the invariant this line exists to enforce.
     if final_confidence > primary_confidence:
         final_confidence = primary_confidence
 

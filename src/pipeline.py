@@ -17,6 +17,7 @@ try:
     )
     from .correlator import correlate
     from .detector import detect_degradations
+    from .float_compare import lt
     from .impact import calculate_impact
     from .memory import IncidentMemory, empty_recall, extract_features
     from .rca import generate_rca
@@ -33,6 +34,7 @@ except ImportError:  # Supports direct script imports from src/.
     )
     from correlator import correlate
     from detector import detect_degradations
+    from float_compare import lt
     from impact import calculate_impact
     from memory import IncidentMemory, empty_recall, extract_features
     from rca import generate_rca
@@ -311,7 +313,7 @@ def run_incident(incident: dict, memory: IncidentMemory | None = None) -> dict:
     adjusted_correlation = {**correlation, "confidence": skeptic["final_confidence"]}
     # If skeptic lowered confidence below the resolve threshold, mark unresolved
     if (
-        adjusted_correlation["confidence"] < MIN_CONFIDENCE_FOR_AUTO_ACTION
+        lt(adjusted_correlation["confidence"], MIN_CONFIDENCE_FOR_AUTO_ACTION)
         and correlation["predicted_cause"] != "unresolved"
         and skeptic["outcome"] == "challenged"
     ):

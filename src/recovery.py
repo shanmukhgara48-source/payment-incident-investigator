@@ -12,6 +12,7 @@ try:
         ROUTE_HEALTH_CONFIRMATION_REQUIRED,
         live_api_mode_enabled,
     )
+    from .float_compare import gte, lt
     from .razorpay_integration import get_gateway
 except ImportError:  # Supports direct imports from src/.
     from config import (
@@ -23,6 +24,7 @@ except ImportError:  # Supports direct imports from src/.
         ROUTE_HEALTH_CONFIRMATION_REQUIRED,
         live_api_mode_enabled,
     )
+    from float_compare import gte, lt
     from razorpay_integration import get_gateway
 
 ROUTE_LEVEL_CAUSES = {"bank_psp_downtime", "gateway_error", "network_issue"}
@@ -59,7 +61,7 @@ def recommend_recovery(incident: dict, correlation: dict, impact: dict) -> dict:
             entry["metadata"] = metadata
         audit_trail.append(entry)
 
-    if cause == "unresolved" or confidence < MIN_CONFIDENCE_FOR_AUTO_ACTION:
+    if cause == "unresolved" or lt(confidence, MIN_CONFIDENCE_FOR_AUTO_ACTION):
         primary_action = "escalate to human"
         log(
             primary_action,
@@ -112,9 +114,12 @@ def recommend_recovery(incident: dict, correlation: dict, impact: dict) -> dict:
                 "MAX_RETRIES_PER_PAYMENT",
             )
 
-    confidence_gate_passed = cause != "unresolved" and confidence >= MIN_CONFIDENCE_FOR_AUTO_ACTION
+    confidence_gate_passed = cause != "unresolved" and gte(
+        confidence, MIN_CONFIDENCE_FOR_AUTO_ACTION
+    )
     notification_sent = (
         confidence_gate_passed
+        # failed_gmv_inr is a sum of integer rupee amounts, so this stays exact.
         and impact["failed_gmv_inr"] >= MERCHANT_NOTIFICATION_EXPOSURE_THRESHOLD_INR
     )
     if not confidence_gate_passed:
