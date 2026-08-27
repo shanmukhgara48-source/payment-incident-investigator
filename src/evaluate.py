@@ -105,6 +105,9 @@ def evaluate(data_path: Path = DEFAULT_DATA, output_path: Path = DEFAULT_RESULTS
         "merchant_notification_count": sum(
             record["recovery"]["merchant_notification_sent"] for record in records
         ),
+        "incidents_with_similar_past_incident_count": sum(
+            bool(record["pattern_recall"]["match_count"]) for record in records
+        ),
         "misdiagnosis_count": len(misdiagnoses),
         "detection_exception_count": len(detection_exceptions),
         "false_confident_ambiguous_count": len(false_confident_ambiguous),

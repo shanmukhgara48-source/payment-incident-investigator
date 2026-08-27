@@ -34,6 +34,7 @@ data/simulate.py   60 deterministic incidents: payments, deploys/config,
                    alerts, webhooks, and error traces; 15% ambiguous
 src/detector.py    rolling-baseline comparison per (method, route) pair
 src/correlator.py  independent evidence scoring with a 0.60 honesty gate
+src/memory.py      cosine pattern recall over PRIOR incidents in the batch only
 src/rca.py         human-readable RCA using only computed evidence values
 src/impact.py      attempted, failed, recoverable, and modeled recovered GMV
 src/recovery.py    one primary action, hard bounds, route-health gate, audit

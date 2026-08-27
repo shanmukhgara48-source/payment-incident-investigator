@@ -18,6 +18,7 @@ try:
     from .correlator import correlate
     from .detector import detect_degradations
     from .impact import calculate_impact
+    from .memory import IncidentMemory, empty_recall, extract_features
     from .rca import generate_rca
     from .recovery import recommend_recovery
     from .skeptic import skeptic_review as run_skeptic_review
@@ -33,6 +34,7 @@ except ImportError:  # Supports direct script imports from src/.
     from correlator import correlate
     from detector import detect_degradations
     from impact import calculate_impact
+    from memory import IncidentMemory, empty_recall, extract_features
     from rca import generate_rca
     from recovery import recommend_recovery
     from skeptic import skeptic_review as run_skeptic_review
@@ -279,7 +281,8 @@ def _timeline_markers(
     )
 
 
-def run_incident(incident: dict) -> dict:
+def run_incident(incident: dict, memory: IncidentMemory | None = None) -> dict:
+    """Process one incident. `memory` holds only incidents processed before it."""
     incident_id = incident.get("incident_id", "unknown")
     stage_errors: list[dict] = []
     detection = _safe_stage(
@@ -313,6 +316,38 @@ def run_incident(incident: dict) -> dict:
         and skeptic["outcome"] == "challenged"
     ):
         adjusted_correlation["predicted_cause"] = "unresolved"
+
+    try:
+        top_reason, top_reason_count = _top_failure_reason(incident, detection)
+    except Exception as exc:
+        logger.exception(
+            "failed to summarize failure reason",
+            extra={"incident_id": incident_id, "stage": "record_assembly"},
+        )
+        stage_errors.append({"stage": "record_assembly", "error": str(exc)})
+        top_reason, top_reason_count = "unknown", 0
+
+    # Pattern recall happens before the diagnosis is finalized, but the store only
+    # ever contains incidents already processed in this batch - never future ones.
+    recall_features: dict = {}
+    pattern_recall = empty_recall()
+    if memory is not None:
+        recall_features = _safe_stage(
+            "memory_features",
+            incident_id,
+            lambda: extract_features(detection, adjusted_correlation, top_reason),
+            lambda exc: {},
+            stage_errors,
+        )
+        if recall_features:
+            pattern_recall = _safe_stage(
+                "memory_recall",
+                incident_id,
+                lambda: memory.recall(recall_features, adjusted_correlation["predicted_cause"]),
+                lambda exc: empty_recall(recall_features),
+                stage_errors,
+            )
+
     rca_text = _safe_stage(
         "rca",
         incident_id,
@@ -339,15 +374,20 @@ def run_incident(incident: dict) -> dict:
         lambda exc: _recovery_fallback(incident, exc),
         stage_errors,
     )
-    try:
-        top_reason, top_reason_count = _top_failure_reason(incident, detection)
-    except Exception as exc:
-        logger.exception(
-            "failed to summarize failure reason",
-            extra={"incident_id": incident_id, "stage": "record_assembly"},
+    if memory is not None and recall_features:
+        # Only after this incident is fully resolved does it become visible to
+        # the incidents that follow it.
+        _safe_stage(
+            "memory_remember",
+            incident_id,
+            lambda: memory.remember(
+                incident_id, recall_features, adjusted_correlation, recovery, impact
+            )
+            or {},
+            lambda exc: {},
+            stage_errors,
         )
-        stage_errors.append({"stage": "record_assembly", "error": str(exc)})
-        top_reason, top_reason_count = "unknown", 0
+
     try:
         timeline = _timeline_markers(incident, detection, adjusted_correlation, impact, recovery)
     except Exception as exc:
@@ -368,6 +408,7 @@ def run_incident(incident: dict) -> dict:
         "correlation": adjusted_correlation,
         "primary_diagnosis": correlation,
         "skeptic_review": skeptic,
+        "pattern_recall": pattern_recall,
         "rca_text": rca_text,
         "impact": impact,
         "recovery": recovery,
@@ -384,11 +425,16 @@ def run_pipeline(incidents: list[dict]) -> list[dict]:
         "batch pipeline started",
         extra={"incident_id": "batch", "stage": "pipeline"},
     )
-    records = [run_incident(incident) for incident in incidents]
+    # One store per batch, filled in processing order: incident N can only ever
+    # recall incidents 0..N-1.
+    memory = IncidentMemory()
+    records = [run_incident(incident, memory) for incident in incidents]
     logger.info(
-        "batch pipeline completed incidents=%s incidents_with_errors=%s",
+        "batch pipeline completed incidents=%s incidents_with_errors=%s "
+        "incidents_with_similar_past=%s",
         len(records),
         sum(bool(record["stage_errors"]) for record in records),
+        sum(bool(record["pattern_recall"]["match_count"]) for record in records),
         extra={"incident_id": "batch", "stage": "pipeline"},
     )
     return records

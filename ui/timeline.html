@@ -549,6 +549,75 @@
     .skeptic-conf-row { display: flex; align-items: center; gap: 12px; margin-top: 12px; font-size: 12px; font-weight: 600; }
     .skeptic-conf-row .old { color: var(--rp-text-muted); text-decoration: line-through; }
     .skeptic-conf-row .new { color: var(--rp-navy); font-size: 14px; }
+    .recall-section { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--rp-border); }
+    .recall-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .recall-head h4 {
+      margin: 0;
+      color: var(--rp-navy);
+      font-size: 12px;
+      font-weight: 650;
+      text-transform: uppercase;
+    }
+    .recall-count {
+      display: inline-flex;
+      align-items: center;
+      padding: 3px 9px;
+      border-radius: 12px;
+      color: var(--rp-blue);
+      background: var(--rp-blue-light);
+      font-size: 10px;
+      font-weight: 650;
+    }
+    .recall-empty { margin: 10px 0 0; color: var(--rp-text-muted); font-size: 12px; line-height: 1.6; }
+    .recall-list { margin: 12px 0 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+    .recall-match {
+      padding: 10px 12px;
+      border: 1px solid var(--rp-border);
+      border-left: 3px solid var(--rp-blue);
+      border-radius: 6px;
+      background: var(--rp-bg);
+      font-size: 11px;
+      line-height: 1.6;
+    }
+    .recall-match-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 4px;
+    }
+    .recall-id { color: var(--rp-navy); font-size: 12px; font-weight: 700; }
+    .recall-similarity { color: var(--rp-text-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+    .recall-row { color: var(--rp-text); }
+    .recall-row .recall-label { color: var(--rp-text-muted); text-transform: uppercase; font-size: 9px; font-weight: 700; }
+    .recall-outcome.resolved { color: #087A4B; font-weight: 600; }
+    .recall-outcome.escalated { color: #B54708; font-weight: 600; }
+    .recall-open {
+      margin-top: 6px;
+      padding: 0;
+      color: var(--rp-blue);
+      background: none;
+      border: none;
+      cursor: pointer;
+      font: inherit;
+      font-size: 10px;
+      font-weight: 650;
+      text-transform: uppercase;
+    }
+    .recall-open:hover { text-decoration: underline; }
+    .recall-track {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border: 1px solid #ABEFC6;
+      border-radius: 6px;
+      background: #ECFDF3;
+      color: #05603A;
+      font-size: 11px;
+      line-height: 1.6;
+      font-weight: 600;
+    }
+    .recall-track.none { border-color: #FEDF89; background: #FFFCF0; color: #B54708; }
+    .recall-track em { display: block; margin-top: 4px; color: var(--rp-text-muted); font-style: normal; font-size: 9px; font-weight: 500; }
     footer {
       padding: 18px 24px;
       color: var(--rp-text-muted);
@@ -641,6 +710,7 @@
         </div>
         <div class="toolbar">
           <button class="command-button secondary" id="copy-button" type="button" disabled>Copy RCA</button>
+          <button class="command-button secondary" id="postmortem-button" type="button" disabled>Download postmortem</button>
           <button class="command-button" id="replay-button" type="button" disabled>Replay timeline</button>
         </div>
       </div>
@@ -667,6 +737,7 @@
     const incidentDetail = document.getElementById('incident-detail');
     const replayButton = document.getElementById('replay-button');
     const copyButton = document.getElementById('copy-button');
+    const postmortemButton = document.getElementById('postmortem-button');
     const resultCount = document.getElementById('result-count');
     const filters = {
       search: document.getElementById('search-filter'),
@@ -762,6 +833,39 @@
       </div>`;
     }
 
+    function renderPatternRecall(record) {
+      const recall = record.pattern_recall;
+      if (!recall) return '';
+      const matches = recall.matches || [];
+      const track = recall.resolution_track_record;
+      const trackHtml = track
+        ? `<div class="recall-track ${track.resolved_count ? '' : 'none'}">${escapeHtml(track.statement)}<em>${escapeHtml(track.basis)}</em></div>`
+        : '';
+      const body = matches.length
+        ? `<ul class="recall-list">${matches.map(match => `
+            <li class="recall-match">
+              <div class="recall-match-head">
+                <span class="recall-id">${escapeHtml(match.incident_id)}</span>
+                <span class="recall-similarity">similarity ${Number(match.similarity).toFixed(2)} · matched on ${escapeHtml((match.matched_on || []).join(', ').replaceAll('_', ' ')) || 'numeric signals'}</span>
+              </div>
+              <div class="recall-row"><span class="recall-label">root cause</span> ${escapeHtml(causeLabel(match.root_cause))} (confidence ${Number(match.confidence).toFixed(2)})</div>
+              <div class="recall-row"><span class="recall-label">action taken</span> ${escapeHtml(match.action_taken)}</div>
+              <div class="recall-row"><span class="recall-label">outcome</span> <span class="recall-outcome ${match.resolved ? 'resolved' : 'escalated'}">${escapeHtml(match.outcome)}</span></div>
+              <button class="recall-open" type="button" data-recall-open="${escapeHtml(match.incident_id)}">Open ${escapeHtml(match.incident_id)} →</button>
+            </li>`).join('')}</ul>`
+        : `<p class="recall-empty">${recall.prior_incidents_considered
+            ? `No prior incident cleared the ${Number(recall.similarity_threshold).toFixed(2)} similarity threshold (${recall.prior_incidents_considered} earlier incident${recall.prior_incidents_considered === 1 ? '' : 's'} compared).`
+            : 'First incident in this batch — there is no prior history to recall yet.'}</p>`;
+      return `<div class="recall-section">
+        <div class="recall-head">
+          <h4>Similar past incidents</h4>
+          <span class="recall-count">${recall.prior_incidents_considered} prior compared · ${recall.match_count} match${recall.match_count === 1 ? '' : 'es'}</span>
+        </div>
+        ${body}
+        ${trackHtml}
+      </div>`;
+    }
+
     function renderIncident(record) {
       const correlation = record.correlation;
       const impact = record.impact;
@@ -797,6 +901,7 @@
             </div>
             <p class="rca" id="rca-text">${escapeHtml(record.rca_text)}</p>
             ${renderSkepticReview(record)}
+            ${renderPatternRecall(record)}
             <div class="impact-row">
               <div class="impact-item"><span>attempted_gmv_inr</span><strong>${money(impact.attempted_gmv_inr)}</strong></div>
               <div class="impact-item"><span>failed_gmv_inr</span><strong>${money(impact.failed_gmv_inr)}</strong></div>
@@ -829,8 +934,12 @@
           </div>
           <div class="cf-chart-container"><canvas id="cf-chart" width="800" height="180"></canvas></div>
         </section>`;
+      incidentDetail.querySelectorAll('[data-recall-open]').forEach(button => {
+        button.addEventListener('click', () => openIncident(button.dataset.recallOpen));
+      });
       replayButton.disabled = false;
       copyButton.disabled = false;
+      postmortemButton.disabled = false;
       loadCounterfactual(record.incident_id, 0);
     }
 
@@ -911,6 +1020,7 @@
       incidentView.hidden = true;
       replayButton.disabled = true;
       copyButton.disabled = true;
+      postmortemButton.disabled = true;
     }
 
     function detailSkeleton() {
@@ -929,6 +1039,7 @@
       document.getElementById('incident-subtitle').textContent = 'Fetching the complete evidence record.';
       replayButton.disabled = true;
       copyButton.disabled = true;
+      postmortemButton.disabled = true;
       detailSkeleton();
       try {
         const record = await api(`/api/incidents/${encodeURIComponent(incidentId)}`);
@@ -1171,6 +1282,16 @@
     document.getElementById('overview-button').addEventListener('click', showSummary);
     replayButton.addEventListener('click', replayTimeline);
     copyButton.addEventListener('click', copyRca);
+    postmortemButton.addEventListener('click', () => {
+      if (!state.selectedIncident) return;
+      const id = state.selectedIncident.incident_id;
+      const a = document.createElement('a');
+      a.href = `/api/incidents/${encodeURIComponent(id)}/postmortem.md`;
+      a.download = `${id}-postmortem.md`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    });
     loadDashboard();
   </script>
 </body>

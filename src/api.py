@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -30,6 +30,7 @@ from data.simulate import (
 
 from .counterfactual import MIN_DELAY_MINUTES, MAX_DELAY_MINUTES, estimate_gmv_saved
 from .evaluate import evaluate
+from .postmortem import generate_postmortem
 from .io_utils import write_json_atomic
 from .logging_config import configure_logging
 from .razorpay_integration import get_gateway, integration_status
@@ -324,6 +325,29 @@ def incident_detail(incident_id: str) -> dict[str, Any]:
     if record is None:
         raise HTTPException(status_code=404, detail=f"incident {incident_id!r} was not found")
     return record
+
+
+@app.get("/api/incidents/{incident_id}/postmortem.md")
+def incident_postmortem(incident_id: str) -> PlainTextResponse:
+    if not INCIDENT_ID_PATTERN.fullmatch(incident_id):
+        raise HTTPException(
+            status_code=400,
+            detail="incident id must match INC- followed by exactly four digits",
+        )
+    try:
+        records = store.snapshot()["incidents"]
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    record = next((r for r in records if r["incident_id"] == incident_id), None)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"incident {incident_id!r} was not found")
+    md = generate_postmortem(record)
+    filename = f"{incident_id}-postmortem.md"
+    return PlainTextResponse(
+        content=md,
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/api/incidents/{incident_id}/counterfactual")
