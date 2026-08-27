@@ -618,6 +618,110 @@
     }
     .recall-track.none { border-color: #FEDF89; background: #FFFCF0; color: #B54708; }
     .recall-track em { display: block; margin-top: 4px; color: var(--rp-text-muted); font-style: normal; font-size: 9px; font-weight: 500; }
+    /* Live mode styles */
+    .live-toggle {
+      height: 38px;
+      padding: 0 14px;
+      color: #fff;
+      background: transparent;
+      border: 1px solid rgba(255,255,255,.28);
+      border-radius: 8px;
+      cursor: pointer;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 600;
+      transition: background .15s, border-color .15s;
+    }
+    .live-toggle:hover { background: rgba(255,255,255,.08); }
+    .live-toggle.active {
+      background: var(--rp-success);
+      border-color: var(--rp-success);
+      color: #fff;
+    }
+    .live-feed {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .live-status-bar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 20px;
+      background: var(--rp-surface);
+      border: 1px solid var(--rp-border);
+      border-radius: 10px;
+      box-shadow: var(--rp-shadow);
+    }
+    .live-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--rp-success);
+      animation: pulse-dot 1.5s infinite;
+    }
+    .live-dot.disconnected { background: var(--rp-danger); animation: none; }
+    .live-dot.reconnecting { background: var(--rp-warning); animation: pulse-dot 0.6s infinite; }
+    @keyframes pulse-dot {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.5; transform: scale(0.8); }
+    }
+    .live-status-text { font-size: 13px; font-weight: 600; color: var(--rp-text); flex: 1; }
+    .live-progress { font-size: 11px; color: var(--rp-text-muted); font-weight: 600; }
+    .live-card {
+      padding: 20px 24px;
+      background: var(--rp-surface);
+      border: 1px solid var(--rp-border);
+      border-radius: 10px;
+      box-shadow: var(--rp-shadow);
+      animation: slide-in 0.3s ease;
+      cursor: pointer;
+      transition: box-shadow 0.15s;
+    }
+    .live-card:hover { box-shadow: var(--rp-shadow-raised); }
+    .live-card.processing {
+      border-left: 3px solid var(--rp-blue);
+      opacity: 0.7;
+    }
+    .live-card.processing .live-card-body { display: none; }
+    @keyframes slide-in {
+      from { opacity: 0; transform: translateY(-12px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .live-card-head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .live-card-id { font-weight: 700; color: var(--rp-navy); font-size: 14px; }
+    .live-card-method { color: var(--rp-text-muted); font-size: 12px; }
+    .live-card-timing { margin-left: auto; font-size: 10px; color: var(--rp-text-muted); font-weight: 600; }
+    .live-card-body {
+      margin-top: 10px;
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+    }
+    .live-card-body .live-stat { font-size: 11px; }
+    .live-stat span { display: block; color: var(--rp-text-muted); font-size: 9px; text-transform: uppercase; font-weight: 600; }
+    .live-stat strong { color: var(--rp-navy); font-size: 13px; font-weight: 700; }
+    .live-processing-text {
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--rp-blue);
+      font-weight: 600;
+    }
+    .live-processing-text::after {
+      content: '';
+      animation: ellipsis 1.2s infinite;
+    }
+    @keyframes ellipsis {
+      0% { content: ''; }
+      25% { content: '.'; }
+      50% { content: '..'; }
+      75% { content: '...'; }
+    }
     footer {
       padding: 18px 24px;
       color: var(--rp-text-muted);
@@ -660,6 +764,7 @@
       </div>
       <div class="header-actions">
         <span class="mode-badge simulated" id="integration-mode">Checking mode…</span>
+        <button class="live-toggle" id="live-toggle" type="button">Live Mode</button>
         <button class="nav-button" id="overview-button" type="button">Overview</button>
         <div class="selector">
           <label for="incident-select">Jump to incident</label>
@@ -719,6 +824,24 @@
         <div class="skeleton-line" style="width:88%"></div>
         <div class="skeleton-line" style="width:72%"></div>
       </div>
+    </section>
+    <section id="live-view" class="view" hidden>
+      <div class="view-heading">
+        <div>
+          <div class="eyebrow">Live streaming demo</div>
+          <h2>Live incident feed</h2>
+          <p>Incidents are generated and processed through the full pipeline in real time.</p>
+        </div>
+        <div class="toolbar">
+          <button class="command-button secondary" id="live-stop" type="button" disabled>Stop stream</button>
+        </div>
+      </div>
+      <div class="live-status-bar">
+        <div class="live-dot disconnected" id="live-dot"></div>
+        <div class="live-status-text" id="live-status">Not connected</div>
+        <div class="live-progress" id="live-progress"></div>
+      </div>
+      <div class="live-feed" id="live-feed"></div>
     </section>
   </main>
   <footer><strong>TEST MODE ONLY.</strong> Incident traffic is synthetic. Explicitly enabled Razorpay API calls use test-mode keys; no production money moves.</footer>
@@ -1292,6 +1415,204 @@
       a.click();
       a.remove();
     });
+    // ── Live Mode ──────────────────────────────────────────────
+    const liveView = document.getElementById('live-view');
+    const liveToggle = document.getElementById('live-toggle');
+    const liveDot = document.getElementById('live-dot');
+    const liveStatus = document.getElementById('live-status');
+    const liveProgress = document.getElementById('live-progress');
+    const liveFeed = document.getElementById('live-feed');
+    const liveStop = document.getElementById('live-stop');
+
+    let liveWs = null;
+    let liveActive = false;
+    let reconnectTimer = null;
+    let reconnectAttempts = 0;
+    const MAX_RECONNECT_ATTEMPTS = 5;
+    const RECONNECT_BASE_MS = 1500;
+
+    function setLiveStatus(status, text, progress) {
+      liveDot.className = 'live-dot ' + (status || '');
+      liveStatus.textContent = text;
+      liveProgress.textContent = progress || '';
+    }
+
+    function liveCardProcessing(incidentId, index, total) {
+      const existing = document.getElementById('live-card-' + incidentId);
+      if (existing) return;
+      const card = document.createElement('div');
+      card.className = 'live-card processing';
+      card.id = 'live-card-' + incidentId;
+      card.innerHTML = `
+        <div class="live-card-head">
+          <span class="live-card-id">${escapeHtml(incidentId)}</span>
+          <span class="live-card-method">Processing through pipeline...</span>
+        </div>
+        <div class="live-processing-text">Running detect → correlate → skeptic → RCA → recovery</div>`;
+      liveFeed.prepend(card);
+    }
+
+    function liveCardResult(msg) {
+      const s = msg.summary;
+      const card = document.getElementById('live-card-' + s.incident_id);
+      const resolved = s.cause !== 'unresolved';
+      const html = `
+        <div class="live-card-head">
+          <span class="live-card-id">${escapeHtml(s.incident_id)}</span>
+          <span class="status ${resolved ? 'resolved' : 'unresolved'}">${resolved ? escapeHtml(causeLabel(s.cause)) : 'escalated'}</span>
+          <span class="live-card-method">${escapeHtml(s.method)}</span>
+          <span class="live-card-timing">${msg.pipeline_ms}ms pipeline</span>
+        </div>
+        <div class="live-card-body">
+          <div class="live-stat"><span>Confidence</span><strong class="confidence ${confidenceClass(s.confidence)}">${s.confidence.toFixed(2)}</strong></div>
+          <div class="live-stat"><span>Status</span><strong>${escapeHtml(s.status)}</strong></div>
+          <div class="live-stat"><span>Recovery</span><strong>${escapeHtml(s.recovery_mode)}</strong></div>
+          <div class="live-stat"><span>Failed GMV</span><strong>${money(msg.record.impact.failed_gmv_inr)}</strong></div>
+        </div>`;
+      if (card) {
+        card.className = 'live-card';
+        card.innerHTML = html;
+        card.dataset.liveIncidentId = s.incident_id;
+      } else {
+        const el = document.createElement('div');
+        el.className = 'live-card';
+        el.id = 'live-card-' + s.incident_id;
+        el.innerHTML = html;
+        el.dataset.liveIncidentId = s.incident_id;
+        liveFeed.prepend(el);
+      }
+      // Store the record so clicking can open it
+      const cardEl = document.getElementById('live-card-' + s.incident_id);
+      if (cardEl) {
+        cardEl._liveRecord = msg.record;
+        cardEl.addEventListener('click', function handler() {
+          cardEl.removeEventListener('click', handler);
+          switchToLiveIncident(msg.record);
+        });
+      }
+    }
+
+    function switchToLiveIncident(record) {
+      // Temporarily show the incident in the normal incident view
+      liveView.hidden = true;
+      incidentView.hidden = false;
+      summaryView.hidden = true;
+      state.selectedIncident = record;
+      renderIncident(record);
+    }
+
+    function connectLiveWs() {
+      if (liveWs && liveWs.readyState <= WebSocket.OPEN) return;
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const url = `${protocol}//${location.host}/ws/live?count=10&interval=4`;
+      setLiveStatus('reconnecting', 'Connecting...', '');
+      liveWs = new WebSocket(url);
+
+      liveWs.onopen = () => {
+        reconnectAttempts = 0;
+        setLiveStatus('', 'Connected — waiting for stream', '');
+        liveStop.disabled = false;
+      };
+
+      liveWs.onmessage = (event) => {
+        let msg;
+        try { msg = JSON.parse(event.data); } catch { return; }
+
+        if (msg.type === 'stream_start') {
+          setLiveStatus('', 'Stream started', `0 / ${msg.total_incidents}`);
+          liveFeed.innerHTML = '';
+        } else if (msg.type === 'processing') {
+          setLiveStatus('', `Processing ${msg.incident_id}...`, `${msg.index} / ${msg.total}`);
+          liveCardProcessing(msg.incident_id, msg.index, msg.total);
+        } else if (msg.type === 'incident') {
+          setLiveStatus('', `Received ${msg.summary.incident_id}`, `${msg.index + 1} / ${msg.total}`);
+          liveCardResult(msg);
+        } else if (msg.type === 'stream_end') {
+          setLiveStatus('', `Stream complete — ${msg.incidents_sent} incidents`, '');
+          liveStop.disabled = true;
+        } else if (msg.type === 'error') {
+          setLiveStatus('disconnected', `Error: ${msg.detail}`, '');
+        }
+      };
+
+      liveWs.onclose = () => {
+        liveStop.disabled = true;
+        if (!liveActive) {
+          setLiveStatus('disconnected', 'Disconnected', '');
+          return;
+        }
+        // Auto-reconnect
+        if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+          reconnectAttempts++;
+          const delay = RECONNECT_BASE_MS * reconnectAttempts;
+          setLiveStatus('reconnecting', `Reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`, '');
+          reconnectTimer = setTimeout(connectLiveWs, delay);
+        } else {
+          setLiveStatus('disconnected', 'Connection lost — click Live Mode to retry', '');
+          liveActive = false;
+          liveToggle.classList.remove('active');
+          liveToggle.textContent = 'Live Mode';
+        }
+      };
+
+      liveWs.onerror = () => {
+        // onclose will fire after this
+      };
+    }
+
+    function disconnectLiveWs() {
+      clearTimeout(reconnectTimer);
+      if (liveWs) {
+        liveWs.close();
+        liveWs = null;
+      }
+      setLiveStatus('disconnected', 'Not connected', '');
+      liveStop.disabled = true;
+    }
+
+    function enterLiveMode() {
+      liveActive = true;
+      reconnectAttempts = 0;
+      liveToggle.classList.add('active');
+      liveToggle.textContent = 'Exit Live';
+      summaryView.hidden = true;
+      incidentView.hidden = true;
+      liveView.hidden = false;
+      liveFeed.innerHTML = '';
+      connectLiveWs();
+    }
+
+    function exitLiveMode() {
+      liveActive = false;
+      liveToggle.classList.remove('active');
+      liveToggle.textContent = 'Live Mode';
+      disconnectLiveWs();
+      liveView.hidden = true;
+      summaryView.hidden = false;
+      incidentView.hidden = true;
+      // Re-show the overview
+      showSummary();
+    }
+
+    liveToggle.addEventListener('click', () => {
+      if (liveActive) exitLiveMode();
+      else enterLiveMode();
+    });
+
+    liveStop.addEventListener('click', () => {
+      disconnectLiveWs();
+      setLiveStatus('disconnected', 'Stream stopped by user', '');
+    });
+
+    // Override showSummary to also exit live mode display
+    const _originalShowSummary = showSummary;
+    function showSummaryWithLive() {
+      if (liveActive) exitLiveMode();
+      else _originalShowSummary();
+    }
+    document.getElementById('overview-button').removeEventListener('click', showSummary);
+    document.getElementById('overview-button').addEventListener('click', showSummaryWithLive);
+
     loadDashboard();
   </script>
 </body>

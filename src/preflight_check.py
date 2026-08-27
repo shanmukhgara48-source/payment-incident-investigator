@@ -29,6 +29,11 @@ def main() -> None:
     dataset_ok = (ROOT / "data" / "incidents.json").is_file()
     results_ok = (ROOT / "results.json").is_file()
     fastapi_ok = importlib.util.find_spec("fastapi") is not None
+    # uvicorn needs one of these or it serves every websocket route as a 404.
+    websocket_ok = (
+        importlib.util.find_spec("websockets") is not None
+        or importlib.util.find_spec("wsproto") is not None
+    )
     razorpay_ok = importlib.util.find_spec("razorpay") is not None
     dotenv_ok = importlib.util.find_spec("dotenv") is not None
     readiness = credential_readiness()
@@ -37,6 +42,11 @@ def main() -> None:
     _line(results_ok, "Evaluation snapshot", "results.json is present" if results_ok else "missing")
     _line(fastapi_ok, "Demo server", "FastAPI is installed" if fastapi_ok else "FastAPI is missing")
     _line(dotenv_ok, "Environment loader", "python-dotenv is installed" if dotenv_ok else "python-dotenv is missing")
+    _line(
+        websocket_ok,
+        "Live stream (/ws/live)",
+        "websocket library installed" if websocket_ok else "no websockets/wsproto: /ws/live will 404 under uvicorn",
+    )
     _line(razorpay_ok, "Official SDK", "razorpay is installed" if razorpay_ok else "razorpay is missing")
     _line(
         readiness["key_id_present"] and readiness["key_secret_present"],
@@ -65,7 +75,7 @@ def main() -> None:
     else:
         _line(False, "Razorpay test API", "ping skipped because SDK or test credentials are missing")
 
-    offline_go = dataset_ok and results_ok and fastapi_ok
+    offline_go = dataset_ok and results_ok and fastapi_ok and websocket_ok
     live_go = offline_go and dotenv_ok and razorpay_ok and readiness["ready_for_test_api"] and ping_ok
     print()
     print(f"OFFLINE FALLBACK DEMO: {'GO' if offline_go else 'NO-GO'}")
