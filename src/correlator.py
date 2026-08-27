@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+try:
+    from .config import MIN_CONFIDENCE_FOR_AUTO_ACTION
+except ImportError:  # Supports direct imports from src/.
+    from config import MIN_CONFIDENCE_FOR_AUTO_ACTION
 
-MIN_CONFIDENCE_TO_RESOLVE = 0.60
+MIN_CONFIDENCE_TO_RESOLVE = MIN_CONFIDENCE_FOR_AUTO_ACTION
 
 ERROR_SIGNATURES = {
     "MERCHANT_5XX": ("bad_deploy", "merchant-side"),

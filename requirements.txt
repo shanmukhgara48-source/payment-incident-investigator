@@ -1,1 +1,6 @@
-# Runtime uses only the Python standard library.
+fastapi>=0.115,<1.0
+uvicorn>=0.30,<1.0
+pytest>=8.0,<10.0
+httpx>=0.27,<1.0
+python-dotenv>=1.0,<2.0
+razorpay>=2.0,<3.0

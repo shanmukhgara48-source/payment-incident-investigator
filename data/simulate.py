@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import random
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,8 +13,14 @@ from pathlib import Path
 SEED = 20260827
 DEFAULT_INCIDENT_COUNT = 60
 AMBIGUOUS_FRACTION = 0.15
+MIN_INCIDENT_COUNT = 10
+MAX_INCIDENT_COUNT = 200
+MIN_AMBIGUOUS_FRACTION = 0.0
+MAX_AMBIGUOUS_FRACTION = 0.5
 BASELINE_WINDOW_MINUTES = 30
 CURRENT_WINDOW_MINUTES = 15
+
+logger = logging.getLogger(__name__)
 
 ROUTE_PROFILES = [
     {
@@ -271,8 +278,8 @@ def _signal_streams(
     return deploy_logs, alerts, webhook_events, error_traces
 
 
-def generate_incident(index: int, ambiguous_indexes: set[int]) -> dict:
-    rng = random.Random(SEED + index * 101)
+def generate_incident(index: int, ambiguous_indexes: set[int], seed: int = SEED) -> dict:
+    rng = random.Random(seed + index * 101)
     incident_id = f"INC-{index + 1:04d}"
     current_start = datetime(2026, 8, 20, 0, 0, tzinfo=timezone.utc) + timedelta(minutes=index * 37)
     alert_time = current_start + timedelta(minutes=4)
@@ -321,13 +328,36 @@ def generate_incident(index: int, ambiguous_indexes: set[int]) -> dict:
     )
     top_reason = FAILURE_REASON_BY_CAUSE[cause]
 
+    # Per-minute failure buckets for the current window (used by counterfactual analysis)
+    failure_by_minute: list[dict] = []
+    for minute_offset in range(CURRENT_WINDOW_MINUTES):
+        bucket_start = current_start + timedelta(minutes=minute_offset)
+        bucket_end = current_start + timedelta(minutes=minute_offset + 1)
+        bucket_start_iso = iso(bucket_start)
+        bucket_end_iso = iso(bucket_end)
+        bucket_events = [
+            e for e in payment_events
+            if e["window"] == "current"
+            and bucket_start_iso <= e["timestamp"] < bucket_end_iso
+        ]
+        failed = [e for e in bucket_events if e["status"] == "failed"]
+        failure_by_minute.append({
+            "minute_offset": minute_offset,
+            "timestamp": bucket_start_iso,
+            "total_count": len(bucket_events),
+            "failed_count": len(failed),
+            "failed_gmv_inr": sum(e["amount_inr"] for e in failed),
+        })
+
     return {
         "incident_id": incident_id,
         "window": {
             "baseline_start": iso(baseline_start),
             "current_start": iso(current_start),
             "current_end": iso(current_start + timedelta(minutes=CURRENT_WINDOW_MINUTES)),
+            "detection_minute_offset": 4,
         },
+        "failure_by_minute": failure_by_minute,
         "payment_events": payment_events,
         "deploy_logs": sorted(deploy_logs, key=lambda event: event["timestamp"]),
         "alerts": sorted(alerts, key=lambda event: event["timestamp"]),
@@ -345,19 +375,40 @@ def generate_incident(index: int, ambiguous_indexes: set[int]) -> dict:
     }
 
 
-def generate_dataset(count: int = DEFAULT_INCIDENT_COUNT) -> dict:
-    if count < 1:
-        raise ValueError("count must be positive")
-    ambiguous_count = max(1, round(count * AMBIGUOUS_FRACTION))
-    ambiguous_indexes = set(range(5, count, max(1, count // ambiguous_count)))
-    if len(ambiguous_indexes) > ambiguous_count:
-        ambiguous_indexes = set(sorted(ambiguous_indexes)[:ambiguous_count])
-    while len(ambiguous_indexes) < ambiguous_count:
-        ambiguous_indexes.add(count - len(ambiguous_indexes) - 1)
+def validate_simulation_parameters(count: int, ambiguous_fraction: float) -> None:
+    if not MIN_INCIDENT_COUNT <= count <= MAX_INCIDENT_COUNT:
+        raise ValueError(
+            f"incident count must be between {MIN_INCIDENT_COUNT} and {MAX_INCIDENT_COUNT}"
+        )
+    if not MIN_AMBIGUOUS_FRACTION <= ambiguous_fraction <= MAX_AMBIGUOUS_FRACTION:
+        raise ValueError(
+            "ambiguous-case ratio must be between "
+            f"{MIN_AMBIGUOUS_FRACTION:.1f} and {MAX_AMBIGUOUS_FRACTION:.1f}"
+        )
+
+
+def generate_dataset(
+    count: int = DEFAULT_INCIDENT_COUNT,
+    ambiguous_fraction: float = AMBIGUOUS_FRACTION,
+    seed: int = SEED,
+) -> dict:
+    validate_simulation_parameters(count, ambiguous_fraction)
+    ambiguous_count = round(count * ambiguous_fraction)
+    if ambiguous_fraction > 0:
+        ambiguous_count = max(1, ambiguous_count)
+    ambiguous_indexes = set()
+    if ambiguous_count:
+        ambiguous_indexes = set(range(5, count, max(1, count // ambiguous_count)))
+        if len(ambiguous_indexes) > ambiguous_count:
+            ambiguous_indexes = set(sorted(ambiguous_indexes)[:ambiguous_count])
+        candidate = count - 1
+        while len(ambiguous_indexes) < ambiguous_count:
+            ambiguous_indexes.add(candidate)
+            candidate -= 1
 
     return {
         "metadata": {
-            "seed": SEED,
+            "seed": seed,
             "incident_count": count,
             "ambiguous_incident_count": len(ambiguous_indexes),
             "ambiguous_fraction": len(ambiguous_indexes) / count,
@@ -365,25 +416,37 @@ def generate_dataset(count: int = DEFAULT_INCIDENT_COUNT) -> dict:
             "current_window_minutes": CURRENT_WINDOW_MINUTES,
             "synthetic_data_notice": "All events and money values are synthetic.",
         },
-        "incidents": [generate_incident(index, ambiguous_indexes) for index in range(count)],
+        "incidents": [generate_incident(index, ambiguous_indexes, seed) for index in range(count)],
     }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--count", type=int, default=DEFAULT_INCIDENT_COUNT)
+    parser.add_argument("--ambiguous-ratio", type=float, default=AMBIGUOUS_FRACTION)
+    parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument(
         "--output",
         type=Path,
         default=Path(__file__).with_name("incidents.json"),
     )
     args = parser.parse_args()
-    dataset = generate_dataset(args.count)
+    logging.basicConfig(
+        level=logging.INFO,
+        format=(
+            "%(asctime)s level=%(levelname)s logger=%(name)s "
+            "incident_id=%(incident_id)s stage=%(stage)s message=%(message)s"
+        ),
+    )
+    dataset = generate_dataset(args.count, args.ambiguous_ratio, args.seed)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(dataset, indent=2) + "\n", encoding="utf-8")
-    print(
-        f"Generated {dataset['metadata']['incident_count']} incidents "
-        f"({dataset['metadata']['ambiguous_incident_count']} ambiguous) -> {args.output}"
+    logger.info(
+        "generated incidents=%s ambiguous=%s output=%s",
+        dataset["metadata"]["incident_count"],
+        dataset["metadata"]["ambiguous_incident_count"],
+        args.output,
+        extra={"incident_id": "batch", "stage": "simulate"},
     )
 
 

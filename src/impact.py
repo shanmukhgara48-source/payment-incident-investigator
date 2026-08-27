@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 try:
-    from .recovery import (
+    from .config import (
         ASSUMED_RECOVERY_SUCCESS_RATE,
         MAX_AUTO_RETRY_AMOUNT_INR,
         MAX_RETRIES_PER_PAYMENT,
     )
 except ImportError:  # Supports `python src/evaluate.py`.
-    from recovery import (
+    from config import (
         ASSUMED_RECOVERY_SUCCESS_RATE,
         MAX_AUTO_RETRY_AMOUNT_INR,
         MAX_RETRIES_PER_PAYMENT,

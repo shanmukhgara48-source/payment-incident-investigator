@@ -4,19 +4,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 
 try:
+    from .config import ASSUMED_RECOVERY_SUCCESS_RATE
+    from .io_utils import write_json_atomic
+    from .logging_config import configure_logging
     from .pipeline import run_pipeline
-    from .recovery import ASSUMED_RECOVERY_SUCCESS_RATE
 except ImportError:  # Supports `python src/evaluate.py`.
+    from config import ASSUMED_RECOVERY_SUCCESS_RATE
+    from io_utils import write_json_atomic
+    from logging_config import configure_logging
     from pipeline import run_pipeline
-    from recovery import ASSUMED_RECOVERY_SUCCESS_RATE
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA = ROOT / "data" / "incidents.json"
 DEFAULT_RESULTS = ROOT / "results.json"
+logger = logging.getLogger(__name__)
 
 
 def evaluate(data_path: Path = DEFAULT_DATA, output_path: Path = DEFAULT_RESULTS) -> dict:
@@ -120,7 +126,7 @@ def evaluate(data_path: Path = DEFAULT_DATA, output_path: Path = DEFAULT_RESULTS
         "exceptions": all_exceptions,
         "incidents": records,
     }
-    output_path.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
+    write_json_atomic(output_path, results)
     return results
 
 
@@ -130,23 +136,30 @@ def _money(value: int) -> str:
 
 def print_report(results: dict) -> None:
     metrics = results["aggregate_metrics"]
-    print("PAYMENT INCIDENT INVESTIGATOR + REVENUE RECOVERY COMMANDER")
-    print(f"Incidents evaluated: {metrics['incident_count']} (full dataset)")
-    print(f"Detection accuracy: {metrics['detection_accuracy']:.1%}")
-    print(f"Root-cause accuracy, clear cases: {metrics['root_cause_accuracy_clear_cases']:.1%}")
-    print(f"Honesty rate, ambiguous cases: {metrics['honesty_rate_on_ambiguous_cases']:.1%}")
-    print(f"Attempted GMV: {_money(metrics['total_attempted_gmv_inr'])}")
-    print(f"Failed GMV: {_money(metrics['total_failed_gmv_inr'])}")
-    print(f"Recoverable GMV: {_money(metrics['total_recoverable_gmv_inr'])}")
-    print(
-        f"Modeled recovered amount: {_money(metrics['total_recovered_amount_inr'])} "
-        f"(ASSUMPTION: {results['assumptions']['recovery_success_rate']:.0%} success rate; not measured)"
+    context = {"incident_id": "batch", "stage": "evaluate"}
+    logger.info(
+        "evaluation incidents=%s detection_accuracy=%.1f%% root_cause_accuracy=%.1f%% "
+        "honesty_rate=%.1f%% escalations=%s misdiagnoses=%s",
+        metrics["incident_count"],
+        metrics["detection_accuracy"] * 100,
+        metrics["root_cause_accuracy_clear_cases"] * 100,
+        metrics["honesty_rate_on_ambiguous_cases"] * 100,
+        metrics["escalation_count"],
+        metrics["misdiagnosis_count"],
+        extra=context,
     )
-    print(f"Incident escalations: {metrics['escalation_count']}")
-    print(f"Misdiagnoses: {metrics['misdiagnosis_count']} (full list in results.json)")
-    print("\nSample RCA outputs:")
+    logger.info(
+        "gmv attempted=%s failed=%s recoverable=%s modeled_recovered=%s "
+        "recovery_assumption=%.0f%%_not_measured",
+        _money(metrics["total_attempted_gmv_inr"]),
+        _money(metrics["total_failed_gmv_inr"]),
+        _money(metrics["total_recoverable_gmv_inr"]),
+        _money(metrics["total_recovered_amount_inr"]),
+        results["assumptions"]["recovery_success_rate"] * 100,
+        extra=context,
+    )
     for text in results["example_rca_outputs"]:
-        print(f"- {text}")
+        logger.info("sample_rca=%s", text, extra=context)
 
 
 def main() -> None:
@@ -154,9 +167,15 @@ def main() -> None:
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
     parser.add_argument("--output", type=Path, default=DEFAULT_RESULTS)
     args = parser.parse_args()
+    configure_logging()
     results = evaluate(args.data, args.output)
     print_report(results)
-    print(f"\nWrote {len(results['incidents'])} complete incident records to {args.output}")
+    logger.info(
+        "results written records=%s output=%s",
+        len(results["incidents"]),
+        args.output,
+        extra={"incident_id": "batch", "stage": "evaluate"},
+    )
 
 
 if __name__ == "__main__":

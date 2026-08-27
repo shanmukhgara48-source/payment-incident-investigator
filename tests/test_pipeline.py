@@ -2,7 +2,7 @@ import unittest
 
 from data.simulate import DEFAULT_INCIDENT_COUNT, generate_dataset
 from src.pipeline import run_pipeline
-from src.recovery import ASSUMED_RECOVERY_SUCCESS_RATE, MIN_CONFIDENCE_FOR_AUTO_ACTION
+from src.config import ASSUMED_RECOVERY_SUCCESS_RATE, MIN_CONFIDENCE_FOR_AUTO_ACTION
 
 
 class PipelineTest(unittest.TestCase):

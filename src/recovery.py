@@ -2,12 +2,28 @@
 
 from __future__ import annotations
 
-
-MIN_CONFIDENCE_FOR_AUTO_ACTION = 0.60
-MAX_AUTO_RETRY_AMOUNT_INR = 50_000
-MAX_RETRIES_PER_PAYMENT = 2
-MERCHANT_NOTIFICATION_EXPOSURE_THRESHOLD_INR = 100_000
-ASSUMED_RECOVERY_SUCCESS_RATE = 0.35
+try:
+    from .config import (
+        ASSUMED_RECOVERY_SUCCESS_RATE,
+        MAX_AUTO_RETRY_AMOUNT_INR,
+        MAX_RETRIES_PER_PAYMENT,
+        MERCHANT_NOTIFICATION_EXPOSURE_THRESHOLD_INR,
+        MIN_CONFIDENCE_FOR_AUTO_ACTION,
+        ROUTE_HEALTH_CONFIRMATION_REQUIRED,
+        live_api_mode_enabled,
+    )
+    from .razorpay_integration import get_gateway
+except ImportError:  # Supports direct imports from src/.
+    from config import (
+        ASSUMED_RECOVERY_SUCCESS_RATE,
+        MAX_AUTO_RETRY_AMOUNT_INR,
+        MAX_RETRIES_PER_PAYMENT,
+        MERCHANT_NOTIFICATION_EXPOSURE_THRESHOLD_INR,
+        MIN_CONFIDENCE_FOR_AUTO_ACTION,
+        ROUTE_HEALTH_CONFIRMATION_REQUIRED,
+        live_api_mode_enabled,
+    )
+    from razorpay_integration import get_gateway
 
 ROUTE_LEVEL_CAUSES = {"bank_psp_downtime", "gateway_error", "network_issue"}
 PRIMARY_ACTIONS = {
@@ -26,16 +42,22 @@ def recommend_recovery(incident: dict, correlation: dict, impact: dict) -> dict:
     confidence = correlation["confidence"]
     audit_trail = []
 
-    def log(action: str, reason: str, bounded_by: str) -> None:
-        audit_trail.append(
-            {
-                "incident_id": incident_id,
-                "action": action,
-                "reason": reason,
-                "bounded_by": bounded_by,
-                "timestamp": timestamp,
-            }
-        )
+    def log(
+        action: str,
+        reason: str,
+        bounded_by: str,
+        metadata: dict | None = None,
+    ) -> None:
+        entry = {
+            "incident_id": incident_id,
+            "action": action,
+            "reason": reason,
+            "bounded_by": bounded_by,
+            "timestamp": timestamp,
+        }
+        if metadata:
+            entry["metadata"] = metadata
+        audit_trail.append(entry)
 
     if cause == "unresolved" or confidence < MIN_CONFIDENCE_FOR_AUTO_ACTION:
         primary_action = "escalate to human"
@@ -111,8 +133,53 @@ def recommend_recovery(incident: dict, correlation: dict, impact: dict) -> dict:
         log(
             "merchant notification suppressed",
             f"Failed GMV exposure INR {impact['failed_gmv_inr']:,} stayed below the configured threshold.",
-            "MERCHANT_NOTIFICATION_EXPOSURE_THRESHOLD_INR",
-        )
+                "MERCHANT_NOTIFICATION_EXPOSURE_THRESHOLD_INR",
+            )
+
+    api_outcome = {
+        "mode": "SIMULATED",
+        "live_api_requested": live_api_mode_enabled(),
+        "links": [],
+        "fallback_reason": "No real Razorpay Payment Link action was selected.",
+    }
+    if primary_action == "create Payment Links for high-intent failures":
+        eligible_payments = [
+            event
+            for event in incident["payment_events"]
+            if event["window"] == "current"
+            and event["status"] == "failed"
+            and event["high_intent"]
+            and event["amount_inr"] <= MAX_AUTO_RETRY_AMOUNT_INR
+            and event["retry_count"] < MAX_RETRIES_PER_PAYMENT
+        ]
+        api_outcome = get_gateway().create_recovery_links(incident_id, eligible_payments)
+        if api_outcome["links"]:
+            for link in api_outcome["links"]:
+                log(
+                    "LIVE TEST-MODE Payment Link created",
+                    f"Created Razorpay test Payment Link {link['id']} for INR {link['amount_inr']:,}.",
+                    "MAX_REAL_LINKS_PER_INCIDENT, MAX_REAL_LINKS_PER_DEMO_RUN, TEST_MODE_ONLY",
+                    {
+                        "mode": "LIVE TEST-MODE",
+                        "payment_link_id": link["id"],
+                        "short_url": link["short_url"],
+                        "source_payment_id": link["source_payment_id"],
+                    },
+                )
+            if api_outcome.get("failed_api_call_count"):
+                log(
+                    "LIVE TEST-MODE Payment Link call failed",
+                    f"{api_outcome['failed_api_call_count']} capped test API call(s) failed; no retry was attempted.",
+                    "MAX_REAL_LINKS_PER_DEMO_RUN, REAL_API_CALL_INTERVAL_SECONDS",
+                    {"mode": "LIVE TEST-MODE", "retry_attempted": False},
+                )
+        else:
+            log(
+                "SIMULATED Payment Link recovery",
+                api_outcome["fallback_reason"],
+                "LIVE_API_MODE, TEST_MODE_ONLY",
+                {"mode": "SIMULATED", "real_api_call_made": False},
+            )
 
     modeled_recovered = impact["recovered_amount_inr"] if estimated_recovery_activated else 0
     return {
@@ -121,13 +188,18 @@ def recommend_recovery(incident: dict, correlation: dict, impact: dict) -> dict:
         "merchant_notification_sent": notification_sent,
         "modeled_recovered_amount_inr": modeled_recovered,
         "modeled_recovered_amount_basis": impact["recovered_amount_basis"],
+        "recovery_mode": api_outcome["mode"],
+        "live_api_requested": api_outcome["live_api_requested"],
+        "test_payment_links": api_outcome["links"],
+        "live_api_fallback_reason": api_outcome.get("fallback_reason"),
         "audit_trail": audit_trail,
         "policy": {
             "MIN_CONFIDENCE_FOR_AUTO_ACTION": MIN_CONFIDENCE_FOR_AUTO_ACTION,
             "MAX_AUTO_RETRY_AMOUNT_INR": MAX_AUTO_RETRY_AMOUNT_INR,
             "MAX_RETRIES_PER_PAYMENT": MAX_RETRIES_PER_PAYMENT,
-            "ROUTE_HEALTH_CONFIRMATION_REQUIRED": True,
+            "ROUTE_HEALTH_CONFIRMATION_REQUIRED": ROUTE_HEALTH_CONFIRMATION_REQUIRED,
             "MERCHANT_NOTIFICATION_EXPOSURE_THRESHOLD_INR": MERCHANT_NOTIFICATION_EXPOSURE_THRESHOLD_INR,
             "ASSUMED_RECOVERY_SUCCESS_RATE": ASSUMED_RECOVERY_SUCCESS_RATE,
+            "TEST_MODE_ONLY": True,
         },
     }

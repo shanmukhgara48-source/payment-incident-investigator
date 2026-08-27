@@ -3,3 +3,8 @@ __pycache__/
 .DS_Store
 .venv/
 venv/
+.env
+results.json
+data/incidents.json
+data/created_test_links.json
+.pytest_cache/
