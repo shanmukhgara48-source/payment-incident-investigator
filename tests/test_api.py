@@ -71,6 +71,23 @@ def test_verified_test_webhook_replaces_modeled_recovery_with_actual(
             "mode": "LIVE TEST-MODE",
         }
     ]
+    # This test's premise is a purely modeled incident receiving its FIRST
+    # actual recovery. The checked-in snapshot may already carry a real
+    # reconciliation, so reset that state instead of summing on top of it.
+    seeded_recovery = test_results["incidents"][0]["recovery"]
+    seeded_impact = test_results["incidents"][0]["impact"]
+    for key in (
+        "actual_recovered_by_link_inr",
+        "actual_recovery_events",
+        "actual_recovered_amount_inr",
+    ):
+        seeded_recovery.pop(key, None)
+    seeded_impact.pop("actual_recovered_amount_inr", None)
+    seeded_impact.pop("recovery_measurement_type", None)
+    if "modeled_recovered_amount_inr" in seeded_impact:
+        seeded_impact["recovered_amount_inr"] = seeded_impact.pop(
+            "modeled_recovered_amount_inr"
+        )
     temporary_results.write_text(json.dumps(test_results), encoding="utf-8")
     monkeypatch.setattr(api_module, "RESULTS_PATH", temporary_results)
     monkeypatch.setattr("src.test_link_registry.REGISTRY_PATH", tmp_path / "links.json")

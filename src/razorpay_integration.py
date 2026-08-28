@@ -223,6 +223,12 @@ class RazorpayTestGateway:
         client = self._sdk_client()
         client.utility.verify_webhook_signature(body.decode("utf-8"), signature, webhook_secret)
 
+    def fetch_link(self, link_id: str) -> dict[str, Any]:
+        """Read one Payment Link's current status from the test API."""
+
+        client = self._sdk_client()
+        return self._call(lambda: client.payment_link.fetch(link_id))
+
     def ping(self) -> None:
         client = self._sdk_client()
         self._call(lambda: client.payment_link.all({"count": 1}))
