@@ -69,6 +69,17 @@ def main() -> None:
         parser.error("uvicorn is not installed; run: python -m pip install -r requirements.txt")
         raise exc
 
+    # Without an installed WebSocket library uvicorn silently downgrades to
+    # ws="none": it answers the /ws/live upgrade as a plain HTTP GET, which no
+    # route matches, so the live stream 404s at demo time. Fail loudly instead.
+    from uvicorn.protocols.websockets.auto import AutoWebSocketsProtocol
+
+    if AutoWebSocketsProtocol is None:
+        parser.error(
+            "no WebSocket library installed, so /ws/live would return 404 under uvicorn; "
+            "run: python -m pip install -r requirements.txt"
+        )
+
     from .api import app
 
     uvicorn.run(app, host=args.host, port=args.port, log_config=None, access_log=True)

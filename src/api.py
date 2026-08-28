@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -13,7 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
@@ -29,6 +30,7 @@ from data.simulate import (
 )
 
 from .counterfactual import MIN_DELAY_MINUTES, MAX_DELAY_MINUTES, estimate_gmv_saved
+from .live_stream import stream_incidents, DEFAULT_INTERVAL_SECONDS, LIVE_BATCH_SIZE
 from .evaluate import evaluate
 from .postmortem import generate_postmortem
 from .io_utils import write_json_atomic
@@ -532,6 +534,53 @@ async def razorpay_webhook(request: Request) -> dict[str, Any]:
         "incident_id": link["incident_id"],
         "mode": "LIVE TEST-MODE",
     }
+
+
+@app.websocket("/ws/live")
+async def live_stream(ws: WebSocket):
+    await ws.accept()
+    logger.info(
+        "live stream websocket connected",
+        extra={"incident_id": "live", "stage": "websocket"},
+    )
+    stop = asyncio.Event()
+
+    async def send_json(data: dict) -> None:
+        await ws.send_json(data)
+
+    try:
+        # Parse optional config from query params.
+        params = ws.query_params
+        count = min(int(params.get("count", LIVE_BATCH_SIZE)), 60)
+        count = max(count, 10)  # generate_dataset requires >= 10
+        interval = max(float(params.get("interval", DEFAULT_INTERVAL_SECONDS)), 0.05)
+
+        await stream_incidents(
+            send_json,
+            incident_count=count,
+            interval=interval,
+            stop_event=stop,
+        )
+    except WebSocketDisconnect:
+        logger.info(
+            "live stream websocket disconnected by client",
+            extra={"incident_id": "live", "stage": "websocket"},
+        )
+    except Exception as exc:
+        logger.exception(
+            "live stream error",
+            extra={"incident_id": "live", "stage": "websocket"},
+        )
+        try:
+            await ws.send_json({"type": "error", "detail": str(exc)})
+        except Exception:
+            pass
+    finally:
+        stop.set()
+        try:
+            await ws.close()
+        except Exception:
+            pass
 
 
 @app.get("/", include_in_schema=False)

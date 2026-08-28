@@ -6,10 +6,15 @@ from datetime import datetime, timedelta
 
 try:
     from .config import MIN_CONFIDENCE_FOR_AUTO_ACTION
+    from .float_compare import gte, lt
 except ImportError:  # Supports direct imports from src/.
     from config import MIN_CONFIDENCE_FOR_AUTO_ACTION
+    from float_compare import gte, lt
 
 MIN_CONFIDENCE_TO_RESOLVE = MIN_CONFIDENCE_FOR_AUTO_ACTION
+
+# A resolved diagnosis must also lead the runner-up by this margin.
+MIN_MARGIN_OVER_RUNNER_UP = 0.15
 
 ERROR_SIGNATURES = {
     "MERCHANT_5XX": ("bad_deploy", "merchant-side"),
@@ -126,7 +131,7 @@ def correlate(incident: dict, detection: dict) -> dict:
             add("gateway_error", 0.25, "webhook delivery failures agree with gateway trace")
         elif dominant_trace and dominant_trace["error_code"] == "NET_CONN_RESET":
             add("network_issue", 0.15, "webhook timeouts agree with network trace")
-    if concentration >= 50:
+    if gte(concentration, 50):
         for cause in scores:
             if signals[cause]:
                 add(cause, 0.20, f"{concentration:.1f}% failure concentration")
@@ -135,7 +140,12 @@ def correlate(incident: dict, detection: dict) -> dict:
     best_cause, best_score = ranked[0]
     runner_up_score = ranked[1][1]
     confidence = round(min(0.99, best_score), 2)
-    if confidence < MIN_CONFIDENCE_TO_RESOLVE or best_score - runner_up_score < 0.15:
+    # Both gates compare against human-set decimal policy values. The margin in
+    # particular is a difference of two accumulated float scores (0.40 + 0.35 +
+    # 0.20 and friends), which is exactly where representation error collects.
+    if lt(confidence, MIN_CONFIDENCE_TO_RESOLVE) or lt(
+        best_score - runner_up_score, MIN_MARGIN_OVER_RUNNER_UP
+    ):
         predicted_cause = "unresolved"
     else:
         predicted_cause = best_cause
@@ -169,7 +179,8 @@ def correlate(incident: dict, detection: dict) -> dict:
         "score_by_cause": {key: round(value, 2) for key, value in scores.items()},
         "confidence_rule": (
             f"highest independent-signal score {best_score:.2f}; "
-            f"resolve only at >= {MIN_CONFIDENCE_TO_RESOLVE:.2f} with >= 0.15 lead"
+            f"resolve only at >= {MIN_CONFIDENCE_TO_RESOLVE:.2f} "
+            f"with >= {MIN_MARGIN_OVER_RUNNER_UP:.2f} lead"
         ),
         "supporting_signals": signals[best_cause],
     }

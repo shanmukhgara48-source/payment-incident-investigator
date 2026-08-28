@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from collections import defaultdict
 
+try:
+    from .float_compare import lt
+except ImportError:  # Supports direct imports from src/.
+    from float_compare import lt
+
 
 MIN_SAMPLE_SIZE = 20
 MIN_SUCCESS_RATE_DROP = 0.05
@@ -41,9 +46,13 @@ def detect_degradations(incident: dict) -> dict:
         current_rate = current_stats["successes"] / current_stats["attempts"]
         success_rate_drop = baseline_rate - current_rate
         if (
+            # Sample sizes are integer counts; an exact comparison is correct.
             baseline_stats["attempts"] < MIN_SAMPLE_SIZE
             or current_stats["attempts"] < MIN_SAMPLE_SIZE
-            or success_rate_drop < MIN_SUCCESS_RATE_DROP
+            # `success_rate_drop` is a difference of two float ratios, so a drop
+            # of exactly 0.05 can land a few ULPs low (97/100 - 92/100 gives
+            # 0.04999999999999993) and be rejected. Compare in decimal terms.
+            or lt(success_rate_drop, MIN_SUCCESS_RATE_DROP)
         ):
             continue
 
