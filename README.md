@@ -155,7 +155,7 @@ curl -X POST http://127.0.0.1:8000/api/simulate \
 
 ## Full-run results
 
-These values come from the checked-in deterministic run of all 60 incidents (51 clear, 9 deliberately ambiguous):
+These values come from the deterministic seeded run of all 60 incidents (51 clear, 9 deliberately ambiguous):
 
 | Metric | Full-dataset result |
 |---|---:|
@@ -173,6 +173,74 @@ These values come from the checked-in deterministic run of all 60 incidents (51 
 Nothing is cherry-picked. Generated `results.json` contains all 60 pipeline records, their evidence and audit trails, plus the complete exception list. It is ignored by Git and regenerated on every demo boot.
 
 The previously documented miss (INC-0045, 98.3% detection / 1 misdiagnosis) was a floating-point defect, not a tuning choice. Its true success-rate drop is exactly `0.05`, but `0.97 - 0.92` evaluates to `0.04999999999999993` in binary floating point, so it fell a few ULPs under a `>= 0.05` gate and was rejected. Threshold comparisons now go through `src/float_compare.py`, which compares in decimal terms. See `tests/test_float_precision.py`.
+
+## Proof of live recovery mechanism
+
+The aggregate table above is **modeled**. This section is not: it is one incident
+carried end to end against Razorpay's real test-mode API on 2026-08-28. It is
+included as proof that the recovery mechanism actually executes, and it does
+**not** change the aggregate figure above.
+
+| Field | Verified value |
+|---|---|
+| Incident | `INC-0001` |
+| Source failed payment | `pay_inc0001_upi_collect_current_035` |
+| Payment Link created | `plink_TV3xDAz77LgtbO` |
+| Link URL | `https://rzp.io/rzp/1c1s2g6T` |
+| Amount | INR 7,147 |
+| Razorpay payment ID | `pay_TV4A0vFG7rC8L5` |
+| Captured at | `2026-08-28T04:58:38+00:00` |
+| Evidence basis | `AUTHENTICATED_TEST_API_POLL, TEST_MODE_ONLY` |
+
+Before and after, from `results.json`:
+
+| Field | Before | After |
+|---|---|---|
+| `impact.recovered_amount_inr` | 37,861 | **7,147** |
+| `impact.modeled_recovered_amount_inr` | absent | 37,861 (preserved) |
+| `impact.recovery_measurement_type` | absent | **`ACTUAL TEST-MODE`** |
+| `recovery.actual_recovered_amount_inr` | absent | **7,147** |
+| `recovery.actual_recovery_events` | 0 | 1 |
+
+**Scope, stated plainly: 1 of 61 incidents (1.6%) carries real captured money.**
+That one payment is INR 7,147 against an aggregate of INR 2,415,145 — **0.296%**.
+The other 60 incidents remain the 35% modeling assumption and are labeled
+`SIMULATED`. This proves the mechanism works once; it does not convert the
+aggregate into measured revenue, and the aggregate should not be read as such.
+
+### What was NOT verified
+
+The signed-webhook path was **not** exercised. No public webhook tunnel was
+available and `RAZORPAY_WEBHOOK_SECRET` was unset, so reconciliation used
+`src/reconcile_links.py`, which polls Payment Link status over the authenticated
+test API instead. That path verifies no HMAC signature, so its audit entries are
+labeled `AUTHENTICATED_TEST_API_POLL` rather than `VERIFIED_WEBHOOK_SIGNATURE` —
+the two are deliberately distinct strings so the trail never claims a
+verification that did not happen. Re-running the reconcile is idempotent: the
+second run logs `already reconciled` and leaves the event count at 1.
+
+### Cleanup
+
+The run created 3 links; a further 10 were created by the test suite before the
+hermeticity fix described below. All 12 unpaid links were cancelled via
+`python -m src.cleanup_test_links --execute`, and each cancellation was
+confirmed by re-reading its status from Razorpay. The single paid link is
+retained as evidence. Final state: 12 `cancelled`, 1 `paid`.
+
+### Defect found while doing this
+
+With a real `.env` present, `pytest` issued live Payment Link create calls
+against the configured Razorpay account — 10 of them. Three causes compounded:
+`load_dotenv()` repopulated the variables the credential tests delete;
+the module-level `_gateway` singleton loads `.env` at import time, before any
+fixture can intervene; and the real-uvicorn test's daemon thread outlived
+function-scoped `monkeypatch`, so teardown restored `LIVE_API_MODE=true` while
+the pipeline was still running. Sharpest symptom: the test named
+`test_missing_credentials_falls_back_without_an_api_call` made a real API call.
+With a live-mode key configured, that would have created real payable links.
+Fixed in `tests/conftest.py`, which pins a credential-free, live-API-off floor at
+conftest import time. Verified by running the full suite twice and confirming
+zero new links were created.
 
 ## Sample RCA output
 
