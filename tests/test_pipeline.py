@@ -12,14 +12,24 @@ class PipelineTest(unittest.TestCase):
         cls.output = run_pipeline(cls.dataset["incidents"])
 
     def test_dataset_shape_and_sources(self):
-        self.assertEqual(len(self.dataset["incidents"]), 60)
-        self.assertEqual(self.dataset["metadata"]["ambiguous_incident_count"], 9)
+        # 60 randomly generated incidents + the constructed skeptic-gate case.
+        self.assertEqual(len(self.dataset["incidents"]), 61)
+        self.assertEqual(self.dataset["metadata"]["random_incident_count"], 60)
+        self.assertEqual(
+            self.dataset["metadata"]["constructed_incident_ids"], ["INC-0061"]
+        )
+        # 9 generated ambiguous incidents + the constructed one.
+        self.assertEqual(self.dataset["metadata"]["ambiguous_incident_count"], 10)
         for incident in self.dataset["incidents"]:
             self.assertTrue(incident["payment_events"])
             self.assertTrue(incident["deploy_logs"])
             self.assertTrue(incident["alerts"])
             self.assertTrue(incident["webhook_events"])
-            self.assertTrue(incident["error_traces"])
+            # INC-0061 carries no error traces on purpose: the absence of a
+            # corroborating error signature is what holds its bad_deploy
+            # diagnosis down at 0.60 so the skeptic can push it under the gate.
+            if incident["ground_truth"].get("constructed_for") != "skeptic_confidence_gate":
+                self.assertTrue(incident["error_traces"])
 
     def test_detector_quality_floor(self):
         matches = 0

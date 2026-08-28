@@ -33,7 +33,9 @@ async def stream_incidents(
         interval: seconds between each incident push.
         stop_event: set this to stop the stream early.
     """
-    dataset = generate_dataset(incident_count)
+    # The stream's `count` query parameter is a promise: return exactly that
+    # many incidents, so skip the appended constructed skeptic-gate case.
+    dataset = generate_dataset(incident_count, include_skeptic_case=False)
     incidents = dataset["incidents"]
     memory = IncidentMemory()
 
