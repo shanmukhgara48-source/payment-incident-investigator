@@ -142,8 +142,16 @@ class ResultStore:
         event_type: str,
         amount_inr: int,
         occurred_at: str,
+        evidence_source: str = "VERIFIED_WEBHOOK_SIGNATURE",
+        source_label: str = "webhook",
     ) -> bool:
-        """Apply one verified test-mode event and persist the new snapshot."""
+        """Apply one confirmed test-mode event and persist the new snapshot.
+
+        `evidence_source` is written verbatim into the audit trail's bounded_by
+        field. The signed-webhook path leaves the default; the API status-poll
+        fallback passes its own label so the trail never claims a signature
+        verification that did not happen.
+        """
 
         with self._lock:
             if self._results is None:
@@ -181,8 +189,8 @@ class ResultStore:
             recovery["recovery_mode"] = "LIVE TEST-MODE"
             recovery["live_api_requested"] = True
 
-            action = f"LIVE TEST-MODE webhook: {event_type}"
-            reason = f"Verified Razorpay test webhook for Payment Link {link_id}."
+            action = f"LIVE TEST-MODE {source_label}: {event_type}"
+            reason = f"Confirmed via Razorpay test {source_label} for Payment Link {link_id}."
             if event_type in {"payment.captured", "payment_link.paid"}:
                 by_link = recovery.setdefault("actual_recovered_by_link_inr", {})
                 by_link[link_id] = max(amount_inr, int(by_link.get(link_id, 0)))
@@ -192,7 +200,8 @@ class ResultStore:
                 impact["recovered_amount_inr"] = actual_total
                 impact["recovery_measurement_type"] = "ACTUAL TEST-MODE"
                 impact["recovered_amount_basis"] = (
-                    "ACTUAL TEST-MODE: verified Razorpay webhook amount; no production money moved."
+                    f"ACTUAL TEST-MODE: confirmed via Razorpay test {source_label}; "
+                    "no production money moved."
                 )
                 recovery["actual_recovered_amount_inr"] = actual_total
                 record["timeline"] = [
@@ -213,12 +222,12 @@ class ResultStore:
                 "incident_id": incident_id,
                 "action": action,
                 "reason": reason,
-                "bounded_by": "VERIFIED_WEBHOOK_SIGNATURE, TEST_MODE_ONLY",
+                "bounded_by": f"{evidence_source}, TEST_MODE_ONLY",
                 "timestamp": occurred_at,
                 "metadata": {
                     "mode": "LIVE TEST-MODE",
                     "payment_link_id": link_id,
-                    "webhook_event_id": event_id,
+                    "evidence_event_id": event_id,
                     "amount_inr": amount_inr,
                 },
             }
@@ -236,7 +245,7 @@ class ResultStore:
             aggregate["actual_test_mode_recovery_incident_count"] = actual_count
             if actual_count:
                 aggregate["recovered_amount_basis"] = (
-                    "MIXED: verified actual Razorpay TEST-MODE webhook amounts for labeled incidents; "
+                    "MIXED: confirmed actual Razorpay TEST-MODE amounts for labeled incidents; "
                     "all remaining amounts use the labeled modeling assumption. No production money moved."
                 )
             write_json_atomic(RESULTS_PATH, results)

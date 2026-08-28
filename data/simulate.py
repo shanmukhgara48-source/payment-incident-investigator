@@ -278,6 +278,28 @@ def _signal_streams(
     return deploy_logs, alerts, webhook_events, error_traces
 
 
+def _failure_by_minute(payment_events: list[dict], current_start: datetime) -> list[dict]:
+    """Per-minute failure buckets for the current window (used by counterfactual analysis)."""
+    buckets: list[dict] = []
+    for minute_offset in range(CURRENT_WINDOW_MINUTES):
+        bucket_start_iso = iso(current_start + timedelta(minutes=minute_offset))
+        bucket_end_iso = iso(current_start + timedelta(minutes=minute_offset + 1))
+        bucket_events = [
+            e for e in payment_events
+            if e["window"] == "current"
+            and bucket_start_iso <= e["timestamp"] < bucket_end_iso
+        ]
+        failed = [e for e in bucket_events if e["status"] == "failed"]
+        buckets.append({
+            "minute_offset": minute_offset,
+            "timestamp": bucket_start_iso,
+            "total_count": len(bucket_events),
+            "failed_count": len(failed),
+            "failed_gmv_inr": sum(e["amount_inr"] for e in failed),
+        })
+    return buckets
+
+
 def generate_incident(index: int, ambiguous_indexes: set[int], seed: int = SEED) -> dict:
     rng = random.Random(seed + index * 101)
     incident_id = f"INC-{index + 1:04d}"
@@ -328,26 +350,7 @@ def generate_incident(index: int, ambiguous_indexes: set[int], seed: int = SEED)
     )
     top_reason = FAILURE_REASON_BY_CAUSE[cause]
 
-    # Per-minute failure buckets for the current window (used by counterfactual analysis)
-    failure_by_minute: list[dict] = []
-    for minute_offset in range(CURRENT_WINDOW_MINUTES):
-        bucket_start = current_start + timedelta(minutes=minute_offset)
-        bucket_end = current_start + timedelta(minutes=minute_offset + 1)
-        bucket_start_iso = iso(bucket_start)
-        bucket_end_iso = iso(bucket_end)
-        bucket_events = [
-            e for e in payment_events
-            if e["window"] == "current"
-            and bucket_start_iso <= e["timestamp"] < bucket_end_iso
-        ]
-        failed = [e for e in bucket_events if e["status"] == "failed"]
-        failure_by_minute.append({
-            "minute_offset": minute_offset,
-            "timestamp": bucket_start_iso,
-            "total_count": len(bucket_events),
-            "failed_count": len(failed),
-            "failed_gmv_inr": sum(e["amount_inr"] for e in failed),
-        })
+    failure_by_minute = _failure_by_minute(payment_events, current_start)
 
     return {
         "incident_id": incident_id,
@@ -375,6 +378,166 @@ def generate_incident(index: int, ambiguous_indexes: set[int], seed: int = SEED)
     }
 
 
+# ── deliberately constructed skeptic-gate case ──────────────────────
+# Every randomly generated incident lands a primary diagnosis at 0.80-0.99
+# confidence, which is too far above MIN_CONFIDENCE_FOR_AUTO_ACTION (0.60) for
+# the skeptic's penalty schedule (max ~0.22 for a bad_deploy) to ever reach the
+# gate. So the 60-incident batch shows challenges but never a challenge that
+# actually blocks auto-action -- a real gap in the demo evidence.
+#
+# This incident closes that gap. It is fully hardcoded, not random: a
+# "bad_deploy" whose entire support is a single overlapping deploy touching
+# 5% of traffic, with no error-trace signature to corroborate it, while
+# failures are smeared across all four routes.
+#
+#   correlator : deploy overlap 0.40 + >=50% concentration 0.20 = 0.60
+#                (exactly clears the resolve bar, runner-up 0.00)
+#   skeptic    : small_blast_radius        -0.100  (5% rollout <= 25%)
+#                low_failure_concentration -0.056  (58.8% < 80%)
+#   final      : 0.60 - 0.156 = 0.44  -> BELOW the 0.60 gate -> escalate
+#
+# Keep the numbers below in sync with that arithmetic; tests/test_skeptic.py
+# asserts the end state.
+SKEPTIC_GATE_ROLLOUT_PCT = 5
+SKEPTIC_GATE_TARGET_TOTAL = 100
+SKEPTIC_GATE_TARGET_BASELINE_FAILURE_RATE = 0.03   # 3 of 100
+SKEPTIC_GATE_TARGET_CURRENT_FAILURE_RATE = 0.30    # 30 of 100
+SKEPTIC_GATE_OTHER_TOTAL = 35
+SKEPTIC_GATE_OTHER_BASELINE_FAILURE_RATE = 1 / 35  # 1 of 35
+SKEPTIC_GATE_OTHER_CURRENT_FAILURE_RATE = 0.20     # 7 of 35
+
+
+def build_skeptic_gate_incident(index: int, seed: int = SEED) -> dict:
+    """Build the constructed incident that drives confidence below the gate.
+
+    `index` is the zero-based position it occupies, so with the default batch
+    of 60 it becomes INC-0061.
+    """
+    rng = random.Random(seed + index * 101)
+    incident_id = f"INC-{index + 1:04d}"
+    current_start = datetime(2026, 8, 20, 0, 0, tzinfo=timezone.utc) + timedelta(minutes=index * 37)
+    alert_time = current_start + timedelta(minutes=4)
+    baseline_start = current_start - timedelta(minutes=BASELINE_WINDOW_MINUTES)
+    target = ROUTE_PROFILES[0]  # UPI Collect / abc@upi
+
+    # Failure counts are chosen so the target pair holds the largest success-rate
+    # drop (it stays the primary degradation) while carrying only 30 of the 51
+    # current-window failures -- 58.8% concentration, above the correlator's 50%
+    # bonus threshold but below the skeptic's 80% dilution threshold.
+    payment_events = []
+    for profile in ROUTE_PROFILES:
+        is_target = profile["sub_type"] == target["sub_type"] and profile["route"] == target["route"]
+        total = SKEPTIC_GATE_TARGET_TOTAL if is_target else SKEPTIC_GATE_OTHER_TOTAL
+        baseline_rate = (
+            SKEPTIC_GATE_TARGET_BASELINE_FAILURE_RATE
+            if is_target
+            else SKEPTIC_GATE_OTHER_BASELINE_FAILURE_RATE
+        )
+        current_rate = (
+            SKEPTIC_GATE_TARGET_CURRENT_FAILURE_RATE
+            if is_target
+            else SKEPTIC_GATE_OTHER_CURRENT_FAILURE_RATE
+        )
+        for window, start, minutes, rate in (
+            ("baseline", baseline_start, BASELINE_WINDOW_MINUTES, baseline_rate),
+            ("current", current_start, CURRENT_WINDOW_MINUTES, current_rate),
+        ):
+            payment_events.extend(
+                _payment_events(
+                    rng, incident_id, profile, window, start, minutes, total, rate, "bad_deploy"
+                )
+            )
+    payment_events.sort(key=lambda event: event["timestamp"])
+
+    deploy_logs = [
+        # Unrelated background deploy: no affected method/route, so it never matches.
+        {
+            "source": "deploy_logs",
+            "event_type": "deploy",
+            "service": "settlements-ledger",
+            "version": "v4.2.1",
+            "rollout_pct": 10,
+            "timestamp": iso(current_start - timedelta(minutes=9)),
+            "affected_method": None,
+            "affected_route": None,
+        },
+        # The sole piece of evidence behind the bad_deploy diagnosis -- and it
+        # only ever reached 5% of traffic.
+        {
+            "source": "deploy_logs",
+            "event_type": "deploy",
+            "service": "merchant-checkout",
+            "version": "v8.14.0",
+            "rollout_pct": SKEPTIC_GATE_ROLLOUT_PCT,
+            "timestamp": iso(current_start - timedelta(minutes=2)),
+            "affected_method": target["sub_type"],
+            "affected_route": target["route"],
+        },
+    ]
+    alerts = [
+        {
+            "source": "alerts",
+            "metric": f"payment_success_rate:{target['sub_type']}:{target['route']}",
+            "threshold_breached": "rolling_baseline_minus_5pp",
+            "timestamp": iso(alert_time),
+        }
+    ]
+    # Delivered, not failed: no webhook signal for gateway_error or network_issue.
+    webhook_events = [
+        {
+            "source": "webhook_events",
+            "type": "payment.failed",
+            "delivery_status": "delivered",
+            "timestamp": iso(current_start + timedelta(minutes=5)),
+        }
+    ]
+    # Deliberately empty. With no dominant error code there is no signature to
+    # corroborate bad_deploy -- which is what holds confidence down at exactly
+    # 0.60 instead of the 0.95 a normal bad_deploy incident scores.
+    error_traces: list[dict] = []
+
+    return {
+        "incident_id": incident_id,
+        "window": {
+            "baseline_start": iso(baseline_start),
+            "current_start": iso(current_start),
+            "current_end": iso(current_start + timedelta(minutes=CURRENT_WINDOW_MINUTES)),
+            "detection_minute_offset": 4,
+        },
+        "failure_by_minute": _failure_by_minute(payment_events, current_start),
+        "payment_events": payment_events,
+        "deploy_logs": sorted(deploy_logs, key=lambda event: event["timestamp"]),
+        "alerts": alerts,
+        "webhook_events": webhook_events,
+        "error_traces": error_traces,
+        "ground_truth": {
+            # Ground truth is "unresolved" on purpose. The evidence genuinely
+            # does not identify a cause: a 5% deploy cannot explain a 27-point
+            # drop spread over four routes. Escalating is the correct outcome,
+            # so this is scored as an ambiguous case the system is expected to
+            # be honest about, not as a clear case it is expected to name.
+            "cause": "unresolved",
+            "is_ambiguous": True,
+            "affected_method": target["sub_type"],
+            "affected_method_display": target["display_name"],
+            "affected_route": target["route"],
+            "injected_failure_rate_spike": round(
+                SKEPTIC_GATE_TARGET_CURRENT_FAILURE_RATE
+                - SKEPTIC_GATE_TARGET_BASELINE_FAILURE_RATE,
+                3,
+            ),
+            "top_failure_reason": FAILURE_REASON_BY_CAUSE["bad_deploy"],
+            "constructed_for": "skeptic_confidence_gate",
+            "construction_note": (
+                "Deliberately constructed to exercise the skeptic gate: a thinly "
+                "supported bad_deploy diagnosis (5% rollout, no error signature, "
+                "58.8% failure concentration) that the skeptic pushes from 0.60 "
+                "to 0.44, below MIN_CONFIDENCE_FOR_AUTO_ACTION."
+            ),
+        },
+    }
+
+
 def validate_simulation_parameters(count: int, ambiguous_fraction: float) -> None:
     if not MIN_INCIDENT_COUNT <= count <= MAX_INCIDENT_COUNT:
         raise ValueError(
@@ -391,7 +554,15 @@ def generate_dataset(
     count: int = DEFAULT_INCIDENT_COUNT,
     ambiguous_fraction: float = AMBIGUOUS_FRACTION,
     seed: int = SEED,
+    include_skeptic_case: bool = True,
 ) -> dict:
+    """Generate `count` random incidents, plus the constructed skeptic-gate case.
+
+    `include_skeptic_case` appends one extra, fully deterministic incident
+    (INC-0061 for the default batch of 60) that drives confidence below the
+    auto-action gate. Callers that need exactly `count` incidents -- the
+    /ws/live stream, whose query parameter is a promise -- pass False.
+    """
     validate_simulation_parameters(count, ambiguous_fraction)
     ambiguous_count = round(count * ambiguous_fraction)
     if ambiguous_fraction > 0:
@@ -406,17 +577,27 @@ def generate_dataset(
             ambiguous_indexes.add(candidate)
             candidate -= 1
 
+    incidents = [generate_incident(index, ambiguous_indexes, seed) for index in range(count)]
+    constructed_ids: list[str] = []
+    if include_skeptic_case:
+        skeptic_case = build_skeptic_gate_incident(count, seed)
+        incidents.append(skeptic_case)
+        constructed_ids.append(skeptic_case["incident_id"])
+
+    ambiguous_total = len(ambiguous_indexes) + len(constructed_ids)
     return {
         "metadata": {
             "seed": seed,
-            "incident_count": count,
-            "ambiguous_incident_count": len(ambiguous_indexes),
-            "ambiguous_fraction": len(ambiguous_indexes) / count,
+            "incident_count": len(incidents),
+            "random_incident_count": count,
+            "constructed_incident_ids": constructed_ids,
+            "ambiguous_incident_count": ambiguous_total,
+            "ambiguous_fraction": ambiguous_total / len(incidents),
             "baseline_window_minutes": BASELINE_WINDOW_MINUTES,
             "current_window_minutes": CURRENT_WINDOW_MINUTES,
             "synthetic_data_notice": "All events and money values are synthetic.",
         },
-        "incidents": [generate_incident(index, ambiguous_indexes, seed) for index in range(count)],
+        "incidents": incidents,
     }
 
 

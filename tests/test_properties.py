@@ -18,8 +18,12 @@ def test_detector_flags_the_injected_method_route_pair():
     assert detection["primary_degradation"]["route"] == incident["ground_truth"]["affected_route"]
 
 
-def test_ambiguous_incidents_never_cross_the_confidence_gate():
-    incidents = generate_dataset(count=20, ambiguous_fraction=0.25, seed=202)["incidents"]
+def test_generated_ambiguous_incidents_never_cross_the_confidence_gate():
+    """The generator's ambiguous incidents carry contradictory traces, so the
+    correlator alone already refuses to name a cause -- no skeptic needed."""
+    incidents = generate_dataset(
+        count=20, ambiguous_fraction=0.25, seed=202, include_skeptic_case=False
+    )["incidents"]
     ambiguous = [incident for incident in incidents if incident["ground_truth"]["is_ambiguous"]]
 
     assert ambiguous
@@ -27,6 +31,22 @@ def test_ambiguous_incidents_never_cross_the_confidence_gate():
         result = correlate(incident, detect_degradations(incident))
         assert result["predicted_cause"] == "unresolved"
         assert result["confidence"] < MIN_CONFIDENCE_FOR_AUTO_ACTION
+
+
+def test_every_ambiguous_incident_ends_below_the_gate_after_the_full_pipeline():
+    """The safety invariant that actually matters: no ambiguous incident is
+    ever auto-actioned. Which layer enforces it differs -- the generated ones
+    stall at the correlator, the constructed INC-0061 is caught by the skeptic
+    only -- but the end state must be identical for all of them."""
+    dataset = generate_dataset(count=20, ambiguous_fraction=0.25, seed=202)
+    records = run_pipeline(dataset["incidents"])
+    ambiguous = [r for r in records if r["ground_truth"]["is_ambiguous"]]
+
+    assert ambiguous
+    for record in ambiguous:
+        assert record["correlation"]["predicted_cause"] == "unresolved"
+        assert record["correlation"]["confidence"] < MIN_CONFIDENCE_FOR_AUTO_ACTION
+        assert record["recovery"]["primary_action"] == "escalate to human"
 
 
 def test_recovery_never_auto_retries_a_payment_above_the_cap():

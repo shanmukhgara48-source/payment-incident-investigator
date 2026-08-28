@@ -2,10 +2,15 @@
 
 import unittest
 
-from data.simulate import DEFAULT_INCIDENT_COUNT, generate_dataset
+from data.simulate import (
+    DEFAULT_INCIDENT_COUNT,
+    build_skeptic_gate_incident,
+    generate_dataset,
+)
+from src.config import MIN_CONFIDENCE_FOR_AUTO_ACTION
 from src.detector import detect_degradations
 from src.correlator import correlate
-from src.pipeline import run_pipeline
+from src.pipeline import run_incident, run_pipeline
 from src.skeptic import skeptic_review
 
 
@@ -64,15 +69,61 @@ class SkepticInvariantTest(unittest.TestCase):
             self.assertIn(sr["outcome"], {"confirmed", "challenged"})
             self.assertGreaterEqual(sr["checks_performed"], 5, "Should run at least 5 rules")
 
-    def test_ambiguous_cases_unaffected_by_skeptic(self):
-        """Ambiguous (unresolved) cases should pass through with zero penalty."""
-        ambiguous = [r for r in self.records if r["ground_truth"]["is_ambiguous"]]
-        self.assertTrue(ambiguous, "Dataset should have ambiguous cases")
-        for record in ambiguous:
+    def test_generated_ambiguous_cases_pass_through_skeptic_untouched(self):
+        """The generator's ambiguous incidents are already unresolved at the
+        correlator, so every skeptic rule early-returns on them."""
+        generated = [
+            r for r in self.records
+            if r["ground_truth"]["is_ambiguous"]
+            and r["ground_truth"].get("constructed_for") is None
+        ]
+        self.assertTrue(generated, "Dataset should have generated ambiguous cases")
+        for record in generated:
             sr = record["skeptic_review"]
             self.assertEqual(sr["outcome"], "confirmed")
             self.assertEqual(sr["total_penalty"], 0.0)
             self.assertEqual(sr["final_confidence"], sr["primary_confidence"])
+
+    def test_no_ambiguous_case_is_ever_auto_actioned(self):
+        """The invariant that actually matters. Unlike the test above, this one
+        holds for the constructed skeptic-gate case too -- there the correlator
+        IS fooled, and the skeptic is the only thing standing between a 0.60
+        bad_deploy diagnosis and an automated recovery action."""
+        ambiguous = [r for r in self.records if r["ground_truth"]["is_ambiguous"]]
+        self.assertTrue(ambiguous, "Dataset should have ambiguous cases")
+        for record in ambiguous:
+            self.assertEqual(
+                record["correlation"]["predicted_cause"],
+                "unresolved",
+                f"{record['incident_id']} named a cause on ambiguous evidence",
+            )
+            self.assertLess(
+                record["skeptic_review"]["final_confidence"],
+                MIN_CONFIDENCE_FOR_AUTO_ACTION,
+                f"{record['incident_id']} finished at or above the auto-action gate",
+            )
+            self.assertEqual(record["recovery"]["primary_action"], "escalate to human")
+
+    def test_batch_contains_a_diagnosis_the_skeptic_actually_blocked(self):
+        """Demo-evidence guard for the gap this case was built to close.
+
+        Before INC-0061 the batch was 54 confirmed / 6 challenged / 0 pushed
+        below the gate: the skeptic never once changed an outcome. At least one
+        incident must clear the gate on primary confidence and then be driven
+        under it by the skeptic, or that claim is unsupported again."""
+        blocked = [
+            r for r in self.records
+            if r["skeptic_review"]["primary_confidence"] >= MIN_CONFIDENCE_FOR_AUTO_ACTION
+            and r["skeptic_review"]["final_confidence"] < MIN_CONFIDENCE_FOR_AUTO_ACTION
+        ]
+        self.assertTrue(
+            blocked,
+            "No incident is blocked by the skeptic; the confidence gate is "
+            "untested by the dataset.",
+        )
+        for record in blocked:
+            self.assertEqual(record["skeptic_review"]["outcome"], "challenged")
+            self.assertEqual(record["recovery"]["primary_action"], "escalate to human")
 
 
 class SkepticChallengeTest(unittest.TestCase):
@@ -155,3 +206,52 @@ class SkepticChallengeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SkepticGateCaseTest(unittest.TestCase):
+    """INC-0061: the constructed incident that exercises the confidence gate.
+
+    Pins the exact arithmetic documented in data/simulate.py. If a rule
+    penalty or a correlator weight changes, this fails loudly rather than
+    silently ceasing to test the gate.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.incident = build_skeptic_gate_incident(DEFAULT_INCIDENT_COUNT)
+        cls.record = run_incident(cls.incident)
+
+    def test_it_is_the_sixty_first_incident_of_the_default_dataset(self):
+        dataset = generate_dataset(DEFAULT_INCIDENT_COUNT)
+        last = dataset["incidents"][-1]
+        self.assertEqual(last["incident_id"], "INC-0061")
+        self.assertEqual(
+            last["ground_truth"]["constructed_for"], "skeptic_confidence_gate"
+        )
+
+    def test_correlator_is_fooled_into_a_thin_bad_deploy_diagnosis(self):
+        primary = self.record["primary_diagnosis"]
+        self.assertEqual(primary["predicted_cause"], "bad_deploy")
+        self.assertEqual(primary["confidence"], 0.60)
+        # It clears the resolve bar on deploy overlap + concentration alone,
+        # with no error signature behind it.
+        self.assertIsNone(primary["evidence"]["dominant_error_code"])
+
+    def test_skeptic_fires_the_two_intended_rules(self):
+        sr = self.record["skeptic_review"]
+        self.assertEqual(sr["outcome"], "challenged")
+        fired = {c["rule"] for c in sr["challenges"]}
+        self.assertEqual(fired, {"small_blast_radius", "low_failure_concentration"})
+        self.assertEqual(sr["total_penalty"], 0.156)
+
+    def test_final_confidence_lands_below_the_auto_action_gate(self):
+        sr = self.record["skeptic_review"]
+        self.assertEqual(sr["primary_confidence"], 0.60)
+        self.assertEqual(sr["final_confidence"], 0.44)
+        self.assertLess(sr["final_confidence"], MIN_CONFIDENCE_FOR_AUTO_ACTION)
+
+    def test_it_escalates_instead_of_auto_actioning(self):
+        self.assertEqual(self.record["correlation"]["predicted_cause"], "unresolved")
+        self.assertEqual(
+            self.record["recovery"]["primary_action"], "escalate to human"
+        )
