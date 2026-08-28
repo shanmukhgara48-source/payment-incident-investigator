@@ -186,13 +186,17 @@ def recommend_recovery(incident: dict, correlation: dict, impact: dict) -> dict:
                 {"mode": "SIMULATED", "real_api_call_made": False},
             )
 
-    modeled_recovered = impact["recovered_amount_inr"] if estimated_recovery_activated else 0
+    modeled_recovered = impact["retry_recovered_amount_inr"] if estimated_recovery_activated else 0
+    is_reroute = primary_action == "reroute traffic"
+    gmv_protected = impact["gmv_protected_inr"] if is_reroute else 0
     return {
         "primary_action": primary_action,
         "auto_action_taken": primary_action != "escalate to human",
         "merchant_notification_sent": notification_sent,
         "modeled_recovered_amount_inr": modeled_recovered,
         "modeled_recovered_amount_basis": impact["recovered_amount_basis"],
+        "gmv_protected_inr": gmv_protected,
+        "gmv_protected_basis": impact["gmv_protected_basis"] if is_reroute else "N/A — not a reroute action.",
         "recovery_mode": api_outcome["mode"],
         "live_api_requested": api_outcome["live_api_requested"],
         "test_payment_links": api_outcome["links"],

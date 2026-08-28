@@ -81,6 +81,14 @@ def evaluate(data_path: Path = DEFAULT_DATA, output_path: Path = DEFAULT_RESULTS
         if record["correlation"]["predicted_cause"] != "unresolved"
     ]
 
+    retry_eligible = [
+        record for record in records
+        if record["recovery"]["primary_action"] == "create Payment Links for high-intent failures"
+    ]
+    reroute_incidents = [
+        record for record in records
+        if record["recovery"]["primary_action"] == "reroute traffic"
+    ]
     aggregate = {
         "incident_count": len(records),
         "clear_incident_count": len(clear),
@@ -91,6 +99,25 @@ def evaluate(data_path: Path = DEFAULT_DATA, output_path: Path = DEFAULT_RESULTS
         "total_attempted_gmv_inr": sum(record["impact"]["attempted_gmv_inr"] for record in records),
         "total_failed_gmv_inr": sum(record["impact"]["failed_gmv_inr"] for record in records),
         "total_recoverable_gmv_inr": sum(record["impact"]["recoverable_gmv_inr"] for record in records),
+        "retry_eligible_incident_count": len(retry_eligible),
+        "total_retry_recovered_amount_inr": sum(
+            record["impact"]["retry_recovered_amount_inr"] for record in retry_eligible
+        ),
+        "retry_recovered_amount_basis": (
+            f"MODELING ASSUMPTION: {ASSUMED_RECOVERY_SUCCESS_RATE:.0%} success rate applied to "
+            f"recoverable_gmv_inr for {len(retry_eligible)} retry-eligible incidents "
+            f"out of {len(records)} total; not a measured statistic."
+        ),
+        "reroute_incident_count": len(reroute_incidents),
+        "total_gmv_protected_inr": sum(
+            record["recovery"]["gmv_protected_inr"] for record in reroute_incidents
+        ),
+        "gmv_protected_basis": (
+            f"MODELING ASSUMPTION: extrapolated observed failure rate forward; "
+            f"represents prevented future failures for {len(reroute_incidents)} "
+            f"reroute incidents out of {len(records)} total. "
+            f"This is a DIFFERENT metric from retry-recovered — never sum them."
+        ),
         "total_recovered_amount_inr": sum(record["impact"]["recovered_amount_inr"] for record in records),
         "recovered_amount_basis": (
             f"MODELING ASSUMPTION: {ASSUMED_RECOVERY_SUCCESS_RATE:.0%} success rate applied to "
@@ -152,12 +179,18 @@ def print_report(results: dict) -> None:
         extra=context,
     )
     logger.info(
-        "gmv attempted=%s failed=%s recoverable=%s modeled_recovered=%s "
+        "gmv attempted=%s failed=%s recoverable=%s "
+        "retry_recovered=%s (%s/%s retry-eligible) "
+        "gmv_protected=%s (%s reroute) "
         "recovery_assumption=%.0f%%_not_measured",
         _money(metrics["total_attempted_gmv_inr"]),
         _money(metrics["total_failed_gmv_inr"]),
         _money(metrics["total_recoverable_gmv_inr"]),
-        _money(metrics["total_recovered_amount_inr"]),
+        _money(metrics["total_retry_recovered_amount_inr"]),
+        metrics["retry_eligible_incident_count"],
+        metrics["incident_count"],
+        _money(metrics["total_gmv_protected_inr"]),
+        metrics["reroute_incident_count"],
         results["assumptions"]["recovery_success_rate"] * 100,
         extra=context,
     )

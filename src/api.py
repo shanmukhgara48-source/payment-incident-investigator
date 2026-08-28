@@ -238,6 +238,15 @@ class ResultStore:
             aggregate["total_recovered_amount_inr"] = sum(
                 item["impact"]["recovered_amount_inr"] for item in results["incidents"]
             )
+            retry_eligible = [
+                item for item in results["incidents"]
+                if item["recovery"]["primary_action"] == "create Payment Links for high-intent failures"
+            ]
+            aggregate["total_retry_recovered_amount_inr"] = sum(
+                item["impact"].get("retry_recovered_amount_inr", item["impact"].get("recovered_amount_inr", 0))
+                for item in retry_eligible
+            )
+            aggregate["retry_eligible_incident_count"] = len(retry_eligible)
             actual_count = sum(
                 item["impact"].get("recovery_measurement_type") == "ACTUAL TEST-MODE"
                 for item in results["incidents"]
@@ -248,6 +257,7 @@ class ResultStore:
                     "MIXED: confirmed actual Razorpay TEST-MODE amounts for labeled incidents; "
                     "all remaining amounts use the labeled modeling assumption. No production money moved."
                 )
+                aggregate["retry_recovered_amount_basis"] = aggregate["recovered_amount_basis"]
             write_json_atomic(RESULTS_PATH, results)
             self._results = results
             return True

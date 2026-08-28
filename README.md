@@ -36,7 +36,7 @@ src/detector.py    rolling-baseline comparison per (method, route) pair
 src/correlator.py  independent evidence scoring with a 0.60 honesty gate
 src/memory.py      cosine pattern recall over PRIOR incidents in the batch only
 src/rca.py         human-readable RCA using only computed evidence values
-src/impact.py      attempted, failed, recoverable, and modeled recovered GMV
+src/impact.py      attempted, failed, recoverable, retry-recovered, and GMV-protected calculations
 src/recovery.py    one primary action, hard bounds, route-health gate, audit
 src/pipeline.py    end-to-end record construction and evidence timeline
 src/evaluate.py    full-dataset metrics, exceptions, and results.json
@@ -173,8 +173,11 @@ generated (51 clear, 9 deliberately ambiguous) plus the constructed skeptic-gate
 | Attempted GMV | INR 158,292,037 |
 | Failed GMV | INR 21,747,531 |
 | Recoverable GMV | INR 6,988,167 |
-| Modeled recovered amount | INR 2,445,859 |
+| Retry-recovered amount (modeled, from retried payments) | INR 771,163 |
+| Retry-eligible incidents | 20 out of 61 total |
 | Recovery-rate basis | **35% modeling assumption; not measured** |
+| GMV protected (modeled, prevented future failures) | INR 19,802,440 |
+| Reroute incidents | 31 out of 61 total |
 | Incident escalations | 10 |
 | Misdiagnoses | 0 |
 
@@ -209,22 +212,25 @@ Before and after, from `results.json`:
 | Field | Before | After |
 |---|---|---|
 | `impact.recovered_amount_inr` | 37,861 | **7,147** |
+| `impact.retry_recovered_amount_inr` | 37,861 | 37,861 (unchanged) |
 | `impact.modeled_recovered_amount_inr` | absent | 37,861 (preserved) |
 | `impact.recovery_measurement_type` | absent | **`ACTUAL TEST-MODE`** |
 | `recovery.actual_recovered_amount_inr` | absent | **7,147** |
 | `recovery.actual_recovery_events` | 0 | 1 |
 
 **Scope, stated plainly: 1 of 61 incidents (1.6%) carries real captured money.**
-That one payment is INR 7,147 against the modeled aggregate of INR 2,445,859 —
-**0.29%**. The other 60 incidents remain the 35% modeling assumption and are
-labeled `SIMULATED`. This proves the mechanism works once; it does not convert
+That one payment is INR 7,147 against the retry-eligible modeled aggregate —
+the other retry-eligible incidents remain the 35% modeling assumption and are
+labeled `SIMULATED`. Reroute incidents report a separate `gmv_protected_inr`
+figure representing prevented future failures, not recovered past payments.
+These two metrics are never summed — they answer different questions.
+
+This proves the mechanism works once; it does not convert
 the aggregate into measured revenue, and the aggregate should not be read as such.
 
-Substituting the measured 7,147 for INC-0001's modeled 37,861 moves the reported
-aggregate from INR 2,445,859 to INR 2,415,145, and `aggregate_metrics.recovered_amount_basis`
-flips from `MODELING ASSUMPTION` to `MIXED`. A fresh clone shows the modeled
-figure until a reconcile has been run; both numbers are correct for their state,
-which is why the basis string is carried alongside the amount everywhere it appears.
+A fresh clone shows the modeled figure until a reconcile has been run; both
+numbers are correct for their state, which is why the basis string is carried
+alongside the amount everywhere it appears.
 
 ### What was NOT verified
 
@@ -272,4 +278,7 @@ Every percentage, route, timestamp, amount, and confidence value in these string
 
 ## Output contract
 
-Each incident in generated `results.json` includes detection details, correlation evidence and scoring, RCA text, the four exact GMV fields, the selected recovery action, timeline markers, and the full audit trail. By default, `recovered_amount_inr` is `recoverable_gmv_inr × 0.35` and explicitly labeled as modeled. A verified Razorpay test webhook preserves that estimate as `modeled_recovered_amount_inr`, replaces the displayed value with the test event amount, and labels it `ACTUAL TEST-MODE`.
+Each incident in generated `results.json` includes detection details, correlation evidence and scoring, RCA text, the GMV fields, the selected recovery action, timeline markers, and the full audit trail. Two distinct impact metrics are computed:
+
+- **`retry_recovered_amount_inr`** — modeled recovered GMV, scoped to retry-eligible incidents only (`recoverable_gmv_inr × 0.35`). A verified Razorpay test webhook preserves the modeled estimate as `modeled_recovered_amount_inr`, replaces the displayed value with the test event amount, and labels it `ACTUAL TEST-MODE`.
+- **`gmv_protected_inr`** — modeled prevented future GMV, scoped to reroute incidents only. Extrapolates the observed failure rate forward for a configurable window (`PROTECTED_WINDOW_MINUTES`, default 30). This is a different kind of number — prevented future loss, not recovered past loss — and is never summed with retry-recovered.

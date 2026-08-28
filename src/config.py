@@ -46,6 +46,11 @@ REAL_API_CALL_INTERVAL_SECONDS = 1.0
 # Recovery links are intentionally short-lived during a demo.
 PAYMENT_LINK_EXPIRY_MINUTES = 30
 
+# Duration (minutes) used to model how much future GMV would continue failing
+# on a degraded route if no reroute action were taken. Only applies to incidents
+# where the recommended action is "reroute traffic".
+PROTECTED_WINDOW_MINUTES = 30
+
 
 def live_api_mode_enabled() -> bool:
     """Return whether the explicitly gated Razorpay test-mode path is enabled."""
