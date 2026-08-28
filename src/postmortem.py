@@ -106,13 +106,19 @@ def generate_postmortem(record: dict) -> str:
     lines.append(f"| Attempted GMV | {_money(impact.get('attempted_gmv_inr'))} |")
     lines.append(f"| Failed GMV | {_money(impact.get('failed_gmv_inr'))} |")
     lines.append(f"| Recoverable GMV | {_money(impact.get('recoverable_gmv_inr'))} |")
-    lines.append(f"| Recovered amount | {_money(impact.get('recovered_amount_inr'))} |")
+    lines.append(f"| Retry-recovered amount | {_money(impact.get('retry_recovered_amount_inr', impact.get('recovered_amount_inr')))} |")
     lines.append(f"| Failed payment count | {impact.get('failed_count', 0)} |")
     lines.append(f"| Recoverable payment count | {impact.get('recoverable_payment_count', 0)} |")
     basis = impact.get("recovered_amount_basis", "")
     if basis:
         lines.append("")
         lines.append(f"*{basis}*")
+    recovery = record.get("recovery", {})
+    if recovery.get("gmv_protected_inr"):
+        lines.append("")
+        lines.append(f"| GMV protected (prevented future failures) | {_money(recovery['gmv_protected_inr'])} |")
+        lines.append("")
+        lines.append(f"*{recovery.get('gmv_protected_basis', '')}*")
     lines.append("")
 
     # Action taken

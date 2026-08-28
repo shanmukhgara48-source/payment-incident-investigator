@@ -83,7 +83,7 @@
     }
     .metrics {
       display: grid;
-      grid-template-columns: repeat(6, minmax(150px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
       gap: 16px;
     }
     .metric {
@@ -114,6 +114,8 @@
     .metric.danger .metric-value { color: var(--rp-danger); }
     .metric.success .metric-value { color: var(--rp-success); }
     .metric.warning .metric-value { color: var(--rp-warning); }
+    .metric.protected { border-left: 3px solid var(--rp-blue); }
+    .metric.protected .metric-value { color: var(--rp-blue); }
     .assumption { order: 3; color: var(--rp-warning); font-size: 10px; font-weight: 600; margin-top: -3px; }
     .control-band {
       display: flex;
@@ -732,7 +734,7 @@
     }
     footer strong { color: var(--rp-navy); }
     @media (max-width: 1180px) {
-      .metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .metrics { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
       .detail-grid { grid-template-columns: 1fr; }
       .filters { grid-template-columns: repeat(3, 1fr); }
       .filter:first-child { grid-column: span 2; }
@@ -743,7 +745,7 @@
       .header-actions { justify-content: stretch; }
       .selector { width: 100%; }
       main { padding-inline: 24px; }
-      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .metrics { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
       .impact-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .filters { grid-template-columns: 1fr 1fr; }
       .filter:first-child { grid-column: span 2; }
@@ -1029,7 +1031,8 @@
               <div class="impact-item"><span>attempted_gmv_inr</span><strong>${money(impact.attempted_gmv_inr)}</strong></div>
               <div class="impact-item"><span>failed_gmv_inr</span><strong>${money(impact.failed_gmv_inr)}</strong></div>
               <div class="impact-item"><span>recoverable_gmv_inr</span><strong>${money(impact.recoverable_gmv_inr)}</strong></div>
-              <div class="impact-item"><span>recovered_amount_inr</span><strong>${money(impact.recovered_amount_inr)}</strong>${recoveredBadge}</div>
+              <div class="impact-item"><span>retry_recovered_amount_inr</span><strong style="color:var(--rp-success)">${money(impact.retry_recovered_amount_inr || impact.recovered_amount_inr)}</strong>${recoveredBadge}</div>
+              <div class="impact-item"><span>gmv_protected_inr</span><strong style="color:var(--rp-blue)">${money(recovery.gmv_protected_inr || 0)}</strong>${recovery.gmv_protected_inr ? '<span class="assumption-badge" tabindex="0" title="Prevented future failures on degraded route">Protected</span>' : ''}</div>
             </div>
           </section>
           <aside class="section">
@@ -1069,13 +1072,23 @@
     function renderSummary(summary) {
       const assumption = summary.assumptions;
       const hasActual = Number(summary.actual_test_mode_recovery_incident_count || 0) > 0;
-      const recoveredLabel = hasActual ? 'Recovered result' : 'Modeled recovered';
+      const retryCount = summary.retry_eligible_incident_count || 0;
+      const rerouteCount = summary.reroute_incident_count || 0;
+      const totalCount = summary.incident_count || 0;
+      const retryRecoveredLabel = hasActual
+        ? `Recovered (${retryCount}/${totalCount} retry-eligible)`
+        : `Modeled recovered (${retryCount}/${totalCount} retry-eligible)`;
       const recoveredBadge = hasActual ? {
         label: 'MIXED: ACTUAL + MODELED',
-        detail: summary.recovered_amount_basis
+        detail: summary.retry_recovered_amount_basis || summary.recovered_amount_basis
       } : {
         label: `${(assumption.recovery_success_rate * 100).toFixed(0)}% assumption`,
         detail: assumption.recovery_success_rate_label
+      };
+      const protectedLabel = `GMV protected (${rerouteCount}/${totalCount} reroute)`;
+      const protectedBadge = {
+        label: 'Prevented future failures',
+        detail: summary.gmv_protected_basis || 'Extrapolated failure rate forward; not recovered past payments.'
       };
       summaryContent.className = 'metrics';
       summaryContent.removeAttribute('aria-busy');
@@ -1083,7 +1096,8 @@
         ${metric('Attempted GMV', money(summary.total_attempted_gmv_inr))}
         ${metric('Failed GMV', money(summary.total_failed_gmv_inr), 'danger')}
         ${metric('Recoverable GMV', money(summary.total_recoverable_gmv_inr))}
-        ${metric(recoveredLabel, money(summary.total_recovered_amount_inr), 'success', recoveredBadge)}
+        ${metric(retryRecoveredLabel, money(summary.total_retry_recovered_amount_inr || 0), 'success', recoveredBadge)}
+        ${metric(protectedLabel, money(summary.total_gmv_protected_inr || 0), 'protected', protectedBadge)}
         ${metric('Detection accuracy', pct(summary.detection_accuracy))}
         ${metric('Escalations', String(summary.escalation_count), 'warning')}`;
     }

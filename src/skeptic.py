@@ -1,25 +1,68 @@
 """Skeptic agent: adversarial second-pass review of the primary correlator diagnosis.
 
-The skeptic examines the same evidence the correlator saw and looks for
-counter-signals or inconsistencies.  It can only hold or LOWER confidence —
-never raise it.  The output records every check performed and whether it
-challenged the primary or confirmed it.
+Two review paths:
+- **LLM_REASONED**: When OPENAI_API_KEY is set, the evidence and primary
+  diagnosis are sent to an OpenAI model to find counter-arguments.
+- **RULE_BASED** / **RULE_BASED_FALLBACK**: Five deterministic rules check
+  for blast-radius, signature mismatch, missing corroboration, low
+  concentration, and thin margin.
+
+The skeptic can only hold or LOWER confidence — never raise it.  The output
+records every check performed and whether it challenged the primary or
+confirmed it.
 """
 
 from __future__ import annotations
 
+import logging
+
 try:
     from .correlator import ERROR_SIGNATURES
     from .float_compare import gte, lt
+    from .llm import llm_available, llm_call
 except ImportError:
     from correlator import ERROR_SIGNATURES
     from float_compare import gte, lt
+    from llm import llm_available, llm_call
+
+logger = logging.getLogger(__name__)
 
 # ── penalty schedule ────────────────────────────────────────────────
 # Each rule that fires returns a tuple (challenge_text, penalty).
 # Penalties are subtracted from primary confidence to yield the
 # final_confidence.  Multiple rules can fire and their penalties stack,
 # but the result is floored at 0.0.
+
+_SKEPTIC_SYSTEM_PROMPT = """\
+You are an adversarial reviewer of payment incident diagnoses.  Your job is to
+find weaknesses, contradictions, and counter-evidence in the primary diagnosis.
+You can only LOWER confidence, never raise it.
+
+Respond with valid JSON:
+{
+  "challenges": [
+    {
+      "rule": "short_descriptive_name",
+      "challenge": "1-sentence explanation of the weakness",
+      "penalty": 0.XX
+    }
+  ],
+  "total_penalty": 0.XX,
+  "summary": "1-2 sentence overall assessment"
+}
+
+Rules for your response:
+- Each individual penalty must be between 0.01 and 0.15.
+- total_penalty must equal the sum of individual penalties (max 0.50).
+- If you find NO genuine weaknesses, return {"challenges": [], "total_penalty": 0.0, "summary": "..."}.
+- Do NOT manufacture problems — only flag real inconsistencies visible in the evidence.
+- Common things to check:
+  * Small deploy rollout cannot explain widespread failures.
+  * Error signature points to a different cause than diagnosed.
+  * Missing corroborating health/network signal for the diagnosed cause.
+  * Low failure concentration weakens a single-cause hypothesis.
+  * Close margin between top two candidate causes.
+"""
 
 
 def _rule_small_blast_radius(
@@ -154,24 +197,122 @@ SKEPTIC_RULES = [
 ]
 
 
-def skeptic_review(
+def _format_skeptic_prompt(
     incident: dict,
     detection: dict,
     correlation: dict,
-) -> dict:
-    """Run all skeptic rules against the primary diagnosis.
-
-    Returns a dict containing:
-    - ``outcome``: ``"confirmed"`` or ``"challenged"``
-    - ``checks``: list of every rule that was evaluated
-    - ``challenges``: list of rules that fired (subset of checks)
-    - ``total_penalty``: sum of penalties from fired rules
-    - ``final_confidence``: primary confidence minus total_penalty (floored at 0.0)
-    """
-    predicted_cause = correlation.get("predicted_cause", "unresolved")
-    primary_confidence = correlation.get("confidence", 0.0)
+) -> str:
+    """Format evidence and primary diagnosis for the LLM skeptic."""
     evidence = correlation.get("evidence", {})
+    primary = detection.get("primary_degradation", {})
 
+    lines = [
+        f"Incident: {correlation.get('incident_id', 'unknown')}",
+        f"Primary diagnosis: {correlation.get('predicted_cause', 'unresolved')}",
+        f"Primary confidence: {correlation.get('confidence', 0.0):.2f}",
+        "",
+        "=== Evidence summary ===",
+        f"Payment method: {primary.get('sub_type', '?')} via {primary.get('route', '?')}",
+        f"Failure concentration: {evidence.get('concentration_pct', '?')}%",
+        f"Deploy overlap: {evidence.get('deploy_overlap_detail', 'none')}",
+        f"Config change: {evidence.get('config_change_detail', 'none')}",
+        f"Dominant error code: {evidence.get('dominant_error_code', 'none')}",
+        f"Error signature side: {evidence.get('error_signature_side', 'unknown')}",
+        f"Route health failed: {evidence.get('route_health_failed', False)}",
+        f"Route health confirmed: {evidence.get('route_health_confirmed', False)}",
+        f"Network alert: {evidence.get('network_alert', False)}",
+        f"Webhook degraded: {evidence.get('webhook_delivery_degraded', False)}",
+    ]
+
+    scores = evidence.get("score_by_cause", {})
+    if scores:
+        lines.append("")
+        lines.append("=== Rule-based scores by cause ===")
+        for cause, score in sorted(scores.items(), key=lambda x: -x[1]):
+            lines.append(f"  {cause}: {score:.2f}")
+
+    supporting = evidence.get("supporting_signals", [])
+    if supporting:
+        lines.append("")
+        lines.append("=== Supporting signals for primary diagnosis ===")
+        for sig in supporting:
+            lines.append(f"  - {sig}")
+
+    llm_expl = evidence.get("llm_explanation")
+    if llm_expl:
+        lines.append("")
+        lines.append(f"=== Correlator reasoning ===\n{llm_expl}")
+
+    return "\n".join(lines)
+
+
+def _try_llm_skeptic(
+    incident: dict,
+    detection: dict,
+    correlation: dict,
+    primary_confidence: float,
+) -> dict | None:
+    """Attempt an LLM-based adversarial review.  Returns validated result or None."""
+    if not llm_available():
+        return None
+
+    predicted_cause = correlation.get("predicted_cause", "unresolved")
+    if predicted_cause == "unresolved":
+        # Nothing to challenge — LLM adds no value here
+        return None
+
+    user_prompt = _format_skeptic_prompt(incident, detection, correlation)
+    result = llm_call(_SKEPTIC_SYSTEM_PROMPT, user_prompt)
+    if result is None:
+        return None
+
+    # Validate structure
+    challenges = result.get("challenges")
+    if not isinstance(challenges, list):
+        logger.warning("LLM skeptic returned non-list challenges; falling back")
+        return None
+
+    validated_challenges = []
+    total_penalty = 0.0
+    for ch in challenges:
+        if not isinstance(ch, dict):
+            continue
+        penalty = ch.get("penalty", 0)
+        if not isinstance(penalty, (int, float)) or penalty < 0:
+            continue
+        penalty = min(float(penalty), 0.15)  # cap individual penalties
+        validated_challenges.append({
+            "rule": str(ch.get("rule", "llm_challenge")),
+            "fired": True,
+            "challenge": str(ch.get("challenge", "")),
+            "penalty": round(penalty, 3),
+        })
+        total_penalty += penalty
+
+    total_penalty = round(min(total_penalty, 0.50), 3)  # cap total
+    final_confidence = round(max(0.0, primary_confidence - total_penalty), 2)
+
+    # Hard invariant: skeptic can only hold or lower confidence.
+    if final_confidence > primary_confidence:
+        final_confidence = primary_confidence
+
+    return {
+        "challenges": validated_challenges,
+        "total_penalty": total_penalty,
+        "final_confidence": final_confidence,
+        "summary": result.get("summary", ""),
+        "_llm_meta": result.get("_llm_meta"),
+    }
+
+
+def _run_rule_based_skeptic(
+    predicted_cause: str,
+    primary_confidence: float,
+    incident: dict,
+    evidence: dict,
+    detection: dict,
+) -> dict:
+    """Run the five deterministic skeptic rules."""
     checks: list[dict] = []
     challenges: list[dict] = []
     total_penalty = 0.0
@@ -200,11 +341,7 @@ def skeptic_review(
     total_penalty = round(total_penalty, 3)
     final_confidence = round(max(0.0, primary_confidence - total_penalty), 2)
 
-    # Hard invariant: skeptic can only hold or lower confidence.
-    # This comparison is deliberately exact, NOT tolerance-based. It is a clamp,
-    # not a policy threshold: a tolerant `gt` would treat a tiny excess as equal
-    # and skip the clamp, leaving final_confidence above primary_confidence and
-    # violating the invariant this line exists to enforce.
+    # Hard invariant
     if final_confidence > primary_confidence:
         final_confidence = primary_confidence
 
@@ -226,3 +363,55 @@ def skeptic_review(
         "checks": checks,
         "challenges": challenges,
     }
+
+
+def skeptic_review(
+    incident: dict,
+    detection: dict,
+    correlation: dict,
+) -> dict:
+    """Run adversarial review against the primary diagnosis.
+
+    Returns a dict containing:
+    - ``outcome``: ``"confirmed"`` or ``"challenged"``
+    - ``checks``: list of every rule that was evaluated
+    - ``challenges``: list of rules that fired (subset of checks)
+    - ``total_penalty``: sum of penalties from fired rules
+    - ``final_confidence``: primary confidence minus total_penalty (floored at 0.0)
+    - ``reasoning_mode``: ``LLM_REASONED``, ``RULE_BASED``, or ``RULE_BASED_FALLBACK``
+    """
+    predicted_cause = correlation.get("predicted_cause", "unresolved")
+    primary_confidence = correlation.get("confidence", 0.0)
+    evidence = correlation.get("evidence", {})
+
+    # Try LLM path first
+    llm_result = _try_llm_skeptic(incident, detection, correlation, primary_confidence)
+
+    if llm_result is not None:
+        challenges = llm_result["challenges"]
+        outcome = "challenged" if challenges else "confirmed"
+
+        review = {
+            "outcome": outcome,
+            "summary": llm_result["summary"],
+            "primary_confidence": primary_confidence,
+            "total_penalty": llm_result["total_penalty"],
+            "final_confidence": llm_result["final_confidence"],
+            "checks_performed": len(challenges),
+            "challenges_raised": len(challenges),
+            "checks": challenges,
+            "challenges": challenges,
+            "reasoning_mode": "LLM_REASONED",
+        }
+        if llm_result.get("_llm_meta"):
+            review["llm_meta"] = llm_result["_llm_meta"]
+        return review
+
+    # Rule-based path
+    review = _run_rule_based_skeptic(
+        predicted_cause, primary_confidence, incident, evidence, detection,
+    )
+    review["reasoning_mode"] = (
+        "RULE_BASED_FALLBACK" if llm_available() else "RULE_BASED"
+    )
+    return review

@@ -1,15 +1,31 @@
-"""Deterministic, evidence-reporting root-cause correlation engine."""
+"""Evidence-reporting root-cause correlation engine.
+
+Two diagnosis paths:
+- **LLM_REASONED**: When OPENAI_API_KEY is set, the full evidence is sent to
+  an OpenAI model for structured root-cause reasoning.
+- **RULE_BASED** / **RULE_BASED_FALLBACK**: Deterministic weighted scoring.
+  Used when no key is configured, or as automatic fallback when the LLM call
+  fails.
+
+The rule-based scores are always computed and included in the evidence dict
+regardless of which path produces the final diagnosis.
+"""
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 
 try:
     from .config import MIN_CONFIDENCE_FOR_AUTO_ACTION
     from .float_compare import gte, lt
+    from .llm import llm_available, llm_call
 except ImportError:  # Supports direct imports from src/.
     from config import MIN_CONFIDENCE_FOR_AUTO_ACTION
     from float_compare import gte, lt
+    from llm import llm_available, llm_call
+
+logger = logging.getLogger(__name__)
 
 MIN_CONFIDENCE_TO_RESOLVE = MIN_CONFIDENCE_FOR_AUTO_ACTION
 
@@ -34,6 +50,33 @@ VALID_CAUSES = {
     "unresolved",
 }
 
+_CORRELATOR_SYSTEM_PROMPT = """\
+You are a payment incident root-cause analyst.  Given structured evidence from
+a payment degradation incident, determine the most likely root cause.
+
+Valid root causes (pick exactly one):
+- bad_deploy: A merchant-side code deployment caused the failures.
+- bank_psp_downtime: The PSP or bank endpoint is degraded or down.
+- gateway_error: The payment gateway itself is experiencing errors.
+- config_change: A routing configuration change caused misrouting.
+- network_issue: Network-level problems (packet loss, connection resets).
+- unresolved: Evidence is insufficient or contradictory — escalate.
+
+Respond with valid JSON:
+{
+  "predicted_cause": "<one of the six values above>",
+  "confidence": <float between 0.0 and 0.99>,
+  "explanation": "<1-2 sentence explanation of your reasoning>",
+  "supporting_signals": ["<signal 1>", "<signal 2>"]
+}
+
+Rules:
+- If confidence < 0.60 or evidence genuinely points to multiple causes
+  equally, set predicted_cause to "unresolved".
+- Do not invent evidence.  Base your reasoning only on the signals provided.
+- Confidence 0.99 means near-certainty; reserve it for overwhelming evidence.
+"""
+
 
 def _parse_time(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -42,6 +85,153 @@ def _parse_time(value: str) -> datetime:
 def _in_overlap(timestamp: str, start: datetime, end: datetime) -> bool:
     value = _parse_time(timestamp)
     return start - timedelta(minutes=5) <= value <= end
+
+
+def _format_evidence_prompt(
+    incident: dict,
+    primary: dict,
+    overlapping_deploys: list,
+    config_changes: list,
+    dominant_trace: dict | None,
+    signature: tuple | None,
+    concentration: float,
+    route_health_failed: bool,
+    route_health_confirmed: bool,
+    network_alert: bool,
+    webhook_failed: bool,
+    top_failure_reason: str,
+    top_failure_count: int,
+) -> str:
+    """Format all evidence into a structured prompt for the LLM."""
+    method = primary["sub_type"]
+    route = primary["route"]
+    rate_increase = primary.get("rate_increase_pct", "unknown")
+
+    lines = [
+        f"Incident: {incident['incident_id']}",
+        f"Payment method: {method} via {route}",
+        f"Failure rate increase: {rate_increase}%",
+        f"Failure concentration on this route: {concentration:.1f}%",
+        "",
+        "=== Deploy events in window ===",
+    ]
+    if overlapping_deploys:
+        for d in overlapping_deploys:
+            lines.append(
+                f"- {d['service']} {d['version']} at {d['timestamp']} "
+                f"({d['rollout_pct']}% rollout)"
+            )
+    else:
+        lines.append("None")
+
+    lines.append("")
+    lines.append("=== Config changes in window ===")
+    if config_changes:
+        for c in config_changes:
+            lines.append(f"- {c['service']} {c['version']} at {c['timestamp']}")
+    else:
+        lines.append("None")
+
+    lines.append("")
+    lines.append("=== Error traces ===")
+    if dominant_trace:
+        lines.append(
+            f"- Dominant error: {dominant_trace['error_code']} "
+            f"x{dominant_trace['count']} on {dominant_trace.get('affected_endpoint', 'unknown')}"
+        )
+        if signature:
+            lines.append(
+                f"- Error signature interpretation: {signature[1]} "
+                f"(typically associated with {signature[0]})"
+            )
+        else:
+            lines.append("- No known error signature match")
+    else:
+        lines.append("No error traces in window")
+
+    lines.append("")
+    lines.append("=== Health signals ===")
+    if route_health_failed:
+        lines.append(f"- Route health check for {route}: FAILED")
+    elif route_health_confirmed:
+        lines.append(f"- Route health check for {route}: PASSED")
+    else:
+        lines.append(f"- Route health check for {route}: no signal")
+    lines.append(f"- Network packet-loss alert: {'YES' if network_alert else 'NO'}")
+    lines.append(
+        f"- Webhook delivery degraded: {'YES' if webhook_failed else 'NO'}"
+    )
+
+    lines.append("")
+    lines.append("=== Payment failure context ===")
+    lines.append(f"- Top failure reason: {top_failure_reason} ({top_failure_count} events)")
+
+    return "\n".join(lines)
+
+
+def _try_llm_correlate(
+    incident: dict,
+    primary: dict,
+    overlapping_deploys: list,
+    config_changes: list,
+    dominant_trace: dict | None,
+    signature: tuple | None,
+    concentration: float,
+    route_health_failed: bool,
+    route_health_confirmed: bool,
+    network_alert: bool,
+    webhook_failed: bool,
+    top_failure_reason: str,
+    top_failure_count: int,
+) -> dict | None:
+    """Attempt an LLM-based diagnosis.  Returns validated result or None."""
+    if not llm_available():
+        return None
+
+    user_prompt = _format_evidence_prompt(
+        incident,
+        primary,
+        overlapping_deploys,
+        config_changes,
+        dominant_trace,
+        signature,
+        concentration,
+        route_health_failed,
+        route_health_confirmed,
+        network_alert,
+        webhook_failed,
+        top_failure_reason,
+        top_failure_count,
+    )
+
+    result = llm_call(_CORRELATOR_SYSTEM_PROMPT, user_prompt)
+    if result is None:
+        return None
+
+    # Validate the LLM response
+    cause = result.get("predicted_cause")
+    if cause not in VALID_CAUSES:
+        logger.warning(
+            "LLM returned invalid cause %r for %s; falling back",
+            cause,
+            incident["incident_id"],
+        )
+        return None
+
+    confidence = result.get("confidence", 0.0)
+    if not isinstance(confidence, (int, float)):
+        logger.warning("LLM returned non-numeric confidence; falling back")
+        return None
+
+    confidence = round(min(0.99, max(0.0, float(confidence))), 2)
+
+    # Enforce the same resolve gate the rule-based path uses
+    if lt(confidence, MIN_CONFIDENCE_TO_RESOLVE) and cause != "unresolved":
+        cause = "unresolved"
+
+    result["predicted_cause"] = cause
+    result["confidence"] = confidence
+    return result
 
 
 def correlate(incident: dict, detection: dict) -> dict:
@@ -53,6 +243,7 @@ def correlate(incident: dict, detection: dict) -> dict:
             "confidence": 0.0,
             "supporting_signal_count": 0,
             "evidence": {"reason": "No degradation crossed the detector threshold."},
+            "reasoning_mode": "RULE_BASED",
         }
 
     start = _parse_time(primary["window_start"])
@@ -60,6 +251,7 @@ def correlate(incident: dict, detection: dict) -> dict:
     method = primary["sub_type"]
     route = primary["route"]
 
+    # ── evidence extraction (unchanged) ──────────────────────────────
     overlapping_deploys = [
         event
         for event in incident["deploy_logs"]
@@ -109,6 +301,7 @@ def correlate(incident: dict, detection: dict) -> dict:
         if _in_overlap(event["timestamp"], start, end)
     )
 
+    # ── rule-based scoring (always computed, included in evidence) ────
     scores = {cause: 0.0 for cause in VALID_CAUSES if cause != "unresolved"}
     signals = {cause: [] for cause in scores}
 
@@ -139,17 +332,63 @@ def correlate(incident: dict, detection: dict) -> dict:
     ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     best_cause, best_score = ranked[0]
     runner_up_score = ranked[1][1]
-    confidence = round(min(0.99, best_score), 2)
-    # Both gates compare against human-set decimal policy values. The margin in
-    # particular is a difference of two accumulated float scores (0.40 + 0.35 +
-    # 0.20 and friends), which is exactly where representation error collects.
-    if lt(confidence, MIN_CONFIDENCE_TO_RESOLVE) or lt(
+    rule_confidence = round(min(0.99, best_score), 2)
+    if lt(rule_confidence, MIN_CONFIDENCE_TO_RESOLVE) or lt(
         best_score - runner_up_score, MIN_MARGIN_OVER_RUNNER_UP
     ):
-        predicted_cause = "unresolved"
+        rule_predicted = "unresolved"
     else:
-        predicted_cause = best_cause
+        rule_predicted = best_cause
 
+    # ── top failure reason (for LLM prompt context) ──────────────────
+    from collections import Counter
+
+    failure_reasons = Counter(
+        e["failure_reason"]
+        for e in incident["payment_events"]
+        if e["window"] == "current"
+        and e["status"] == "failed"
+        and e["sub_type"] == method
+        and e["route"] == route
+    )
+    if failure_reasons:
+        top_failure_reason, top_failure_count = failure_reasons.most_common(1)[0]
+    else:
+        top_failure_reason, top_failure_count = "none", 0
+
+    # ── LLM diagnosis attempt ────────────────────────────────────────
+    reasoning_mode = "RULE_BASED"
+    llm_meta = None
+    llm_explanation = None
+    predicted_cause = rule_predicted
+    confidence = rule_confidence
+
+    llm_result = _try_llm_correlate(
+        incident,
+        primary,
+        overlapping_deploys,
+        config_changes,
+        dominant_trace,
+        signature,
+        concentration,
+        route_health_failed,
+        route_health_confirmed,
+        network_alert,
+        webhook_failed,
+        top_failure_reason,
+        top_failure_count,
+    )
+
+    if llm_result is not None:
+        predicted_cause = llm_result["predicted_cause"]
+        confidence = llm_result["confidence"]
+        llm_explanation = llm_result.get("explanation", "")
+        llm_meta = llm_result.get("_llm_meta")
+        reasoning_mode = "LLM_REASONED"
+    elif llm_available():
+        reasoning_mode = "RULE_BASED_FALLBACK"
+
+    # ── build result ─────────────────────────────────────────────────
     deploy = overlapping_deploys[0] if overlapping_deploys else None
     config = config_changes[0] if config_changes else None
     evidence = {
@@ -182,12 +421,27 @@ def correlate(incident: dict, detection: dict) -> dict:
             f"resolve only at >= {MIN_CONFIDENCE_TO_RESOLVE:.2f} "
             f"with >= {MIN_MARGIN_OVER_RUNNER_UP:.2f} lead"
         ),
-        "supporting_signals": signals[best_cause],
+        "supporting_signals": (
+            llm_result.get("supporting_signals", signals[best_cause])
+            if llm_result is not None
+            else signals[best_cause]
+        ),
     }
-    return {
+    if llm_explanation:
+        evidence["llm_explanation"] = llm_explanation
+
+    result = {
         "incident_id": incident["incident_id"],
         "predicted_cause": predicted_cause,
         "confidence": confidence,
-        "supporting_signal_count": len(signals[best_cause]),
+        "supporting_signal_count": (
+            len(evidence["supporting_signals"])
+            if evidence["supporting_signals"]
+            else len(signals[best_cause])
+        ),
         "evidence": evidence,
+        "reasoning_mode": reasoning_mode,
     }
+    if llm_meta:
+        result["llm_meta"] = llm_meta
+    return result

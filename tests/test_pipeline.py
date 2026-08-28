@@ -56,7 +56,7 @@ class PipelineTest(unittest.TestCase):
         for record in self.output:
             impact = record["impact"]
             self.assertEqual(
-                impact["recovered_amount_inr"],
+                impact["retry_recovered_amount_inr"],
                 round(impact["recoverable_gmv_inr"] * ASSUMED_RECOVERY_SUCCESS_RATE),
             )
             self.assertIn("MODELING ASSUMPTION", impact["recovered_amount_basis"])

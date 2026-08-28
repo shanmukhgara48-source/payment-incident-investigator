@@ -98,12 +98,16 @@ def _impact_fallback(exc: Exception) -> dict:
         "attempted_gmv_inr": 0,
         "failed_gmv_inr": 0,
         "recoverable_gmv_inr": 0,
+        "retry_recovered_amount_inr": 0,
         "recovered_amount_inr": 0,
         "recovered_amount_basis": (
             f"MODELING ASSUMPTION: {ASSUMED_RECOVERY_SUCCESS_RATE:.0%} success rate; "
             "impact calculation unavailable."
         ),
         "assumed_recovery_success_rate": ASSUMED_RECOVERY_SUCCESS_RATE,
+        "gmv_protected_inr": 0,
+        "gmv_protected_basis": "Impact calculation unavailable.",
+        "gmv_protected_window_minutes": 0,
         "attempt_count": 0,
         "failed_count": 0,
         "recoverable_payment_count": 0,
@@ -149,6 +153,8 @@ def _recovery_fallback(incident: dict, exc: Exception) -> dict:
         "merchant_notification_sent": False,
         "modeled_recovered_amount_inr": 0,
         "modeled_recovered_amount_basis": "No recovery modeled because the recovery stage failed.",
+        "gmv_protected_inr": 0,
+        "gmv_protected_basis": "No protection modeled because the recovery stage failed.",
         "recovery_mode": "SIMULATED",
         "live_api_requested": False,
         "test_payment_links": [],
@@ -259,7 +265,7 @@ def _timeline_markers(
                     (
                         f"Actual TEST-MODE recovery: INR {impact['recovered_amount_inr']:,}"
                         if impact.get("recovery_measurement_type") == "ACTUAL TEST-MODE"
-                        else f"Modeled recovered: INR {impact['recovered_amount_inr']:,} "
+                        else f"Modeled retry-recovered: INR {impact['retry_recovered_amount_inr']:,} "
                         f"({impact['assumed_recovery_success_rate']:.0%} assumption)"
                     )
                 ),

@@ -73,7 +73,7 @@ def test_gmv_math_is_monotonic_for_every_incident():
     for record in records:
         impact = record["impact"]
         assert (
-            impact["recovered_amount_inr"]
+            impact["retry_recovered_amount_inr"]
             <= impact["recoverable_gmv_inr"]
             <= impact["failed_gmv_inr"]
             <= impact["attempted_gmv_inr"]
