@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.config import MAX_REAL_LINKS_PER_DEMO_RUN
-from src.razorpay_integration import RazorpayTestGateway
+from src.razorpay_integration import RazorpayTestGateway, integration_status
 
 
 class FakePaymentLinks:
@@ -111,3 +111,39 @@ def test_official_sdk_webhook_signature_verification(monkeypatch):
     gateway.verify_webhook_signature(body, signature)
     with pytest.raises(Exception):
         gateway.verify_webhook_signature(body, "invalid-signature")
+
+
+def test_mode_label_stays_simulated_when_live_api_is_requested_without_credentials(
+    monkeypatch,
+):
+    """--live-api is a request, not a capability: no keys means nothing was live."""
+    monkeypatch.setenv("LIVE_API_MODE", "true")
+    monkeypatch.delenv("RAZORPAY_KEY_ID", raising=False)
+    monkeypatch.delenv("RAZORPAY_KEY_SECRET", raising=False)
+
+    status = integration_status()
+
+    assert status["live_api_requested"] is True
+    assert status["ready_for_test_api"] is False
+    assert status["mode_label"] == "SIMULATED"
+
+
+def test_mode_label_is_live_test_mode_only_with_a_usable_test_key_pair(monkeypatch):
+    monkeypatch.setenv("LIVE_API_MODE", "true")
+    monkeypatch.setenv("RAZORPAY_KEY_ID", "rzp_test_placeholder")
+    monkeypatch.setenv("RAZORPAY_KEY_SECRET", "placeholder")
+
+    status = integration_status()
+
+    assert status["ready_for_test_api"] is True
+    assert status["mode_label"] == "LIVE TEST-MODE"
+
+
+def test_mode_label_never_claims_live_for_a_production_key(monkeypatch):
+    monkeypatch.setenv("LIVE_API_MODE", "true")
+    monkeypatch.setenv("RAZORPAY_KEY_ID", "rzp_live_placeholder")
+    monkeypatch.setenv("RAZORPAY_KEY_SECRET", "placeholder")
+
+    status = integration_status()
+
+    assert status["mode_label"] == "SIMULATED"

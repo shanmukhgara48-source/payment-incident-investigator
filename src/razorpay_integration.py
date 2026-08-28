@@ -48,7 +48,15 @@ def credential_readiness() -> dict[str, Any]:
         "webhook_secret_present": bool(webhook_secret),
         "test_key_format_valid": is_test_key,
         "ready_for_test_api": bool(is_test_key and key_secret),
-        "mode_label": "LIVE TEST-MODE" if live_api_mode_enabled() else "SIMULATED",
+        # Requesting --live-api is not the same as being able to use it. Label
+        # the run LIVE TEST-MODE only when a usable rzp_test_ key pair is
+        # actually present; otherwise every recovery is simulated and saying
+        # otherwise overstates what the demo did.
+        "mode_label": (
+            "LIVE TEST-MODE"
+            if live_api_mode_enabled() and is_test_key and key_secret
+            else "SIMULATED"
+        ),
     }
 
 
