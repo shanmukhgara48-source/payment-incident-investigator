@@ -176,7 +176,7 @@ generated (51 clear, 9 deliberately ambiguous) plus the constructed skeptic-gate
 | Retry-recovered amount (modeled, from retried payments) | INR 771,163 |
 | Retry-eligible incidents | 20 out of 61 total |
 | Recovery-rate basis | **35% modeling assumption; not measured** |
-| GMV protected (modeled, prevented future failures) | INR 19,802,440 |
+| GMV protected (modeled, prevented future failures) | INR 9.9M–29.7M (15–45 min window; **INR 19.8M** at default 30 min) |
 | Reroute incidents | 31 out of 61 total |
 | Incident escalations | 10 |
 | Misdiagnoses | 0 |
