@@ -133,21 +133,41 @@ class SkepticChallengeTest(unittest.TestCase):
         """A bad_deploy with rollout_pct <= 25% should be challenged by the
         small_blast_radius rule."""
         dataset = generate_dataset(DEFAULT_INCIDENT_COUNT)
-        # INC-0011 is a bad_deploy with 25% rollout in the default dataset
-        inc_0011 = dataset["incidents"][10]  # index 10 = INC-0011
-        self.assertEqual(inc_0011["incident_id"], "INC-0011")
-        self.assertEqual(inc_0011["ground_truth"]["cause"], "bad_deploy")
+        # Signal generation is probabilistic: search for a qualifying incident
+        # rather than relying on a hardcoded INC ID.
+        candidate = None
+        for incident in dataset["incidents"]:
+            gt = incident["ground_truth"]
+            if gt.get("is_ambiguous") or gt["cause"] != "bad_deploy":
+                continue
+            det = detect_degradations(incident)
+            cor = correlate(incident, det)
+            if cor["predicted_cause"] != "bad_deploy":
+                continue
+            primary = det.get("primary_degradation")
+            if not primary:
+                continue
+            deploys = [
+                d for d in incident["deploy_logs"]
+                if d.get("event_type") == "deploy"
+                and d.get("affected_method") == primary["sub_type"]
+                and d.get("affected_route") == primary["route"]
+                and d["rollout_pct"] <= 25
+            ]
+            if deploys:
+                candidate = (incident, det, cor)
+                break
 
-        detection = detect_degradations(inc_0011)
-        correlation = correlate(inc_0011, detection)
-        self.assertEqual(correlation["predicted_cause"], "bad_deploy")
-        primary_conf = correlation["confidence"]
-
-        review = skeptic_review(inc_0011, detection, correlation)
+        self.assertIsNotNone(
+            candidate,
+            "No bad_deploy with rollout <= 25% and correct diagnosis found in batch",
+        )
+        incident, detection, correlation = candidate
+        review = skeptic_review(incident, detection, correlation)
 
         self.assertEqual(review["outcome"], "challenged")
         self.assertGreater(review["total_penalty"], 0)
-        self.assertLess(review["final_confidence"], primary_conf)
+        self.assertLess(review["final_confidence"], correlation["confidence"])
 
         rule_names = [c["rule"] for c in review["challenges"]]
         self.assertIn("small_blast_radius", rule_names)
@@ -172,21 +192,21 @@ class SkepticChallengeTest(unittest.TestCase):
         self.assertIn("low_failure_concentration", rule_names)
 
     def test_stacked_penalties_on_weak_deploy(self):
-        """INC-0031 has both small rollout AND low concentration — both rules should fire."""
-        dataset = generate_dataset(DEFAULT_INCIDENT_COUNT)
-        inc_0031 = dataset["incidents"][30]  # index 30 = INC-0031
-        self.assertEqual(inc_0031["incident_id"], "INC-0031")
+        """The constructed skeptic-gate incident has 5% rollout AND 58.8%
+        concentration — both small_blast_radius and low_failure_concentration
+        rules should fire, and penalties should stack."""
+        incident = build_skeptic_gate_incident(DEFAULT_INCIDENT_COUNT)
+        detection = detect_degradations(incident)
+        correlation = correlate(incident, detection)
 
-        detection = detect_degradations(inc_0031)
-        correlation = correlate(inc_0031, detection)
-        review = skeptic_review(inc_0031, detection, correlation)
+        self.assertEqual(correlation["predicted_cause"], "bad_deploy")
+        review = skeptic_review(incident, detection, correlation)
 
         self.assertEqual(review["outcome"], "challenged")
         self.assertGreaterEqual(review["challenges_raised"], 2)
         rule_names = [c["rule"] for c in review["challenges"]]
         self.assertIn("small_blast_radius", rule_names)
         self.assertIn("low_failure_concentration", rule_names)
-        # Stacked penalty should be larger than either individual rule
         self.assertGreater(review["total_penalty"], 0.10)
 
     def test_strong_incident_is_confirmed(self):

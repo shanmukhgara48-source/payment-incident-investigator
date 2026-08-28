@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import random
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -61,13 +62,134 @@ CAUSES = [
     "network_issue",
 ]
 
-FAILURE_REASON_BY_CAUSE = {
-    "bad_deploy": "gateway_error",
-    "bank_psp_downtime": "psp_not_available",
-    "gateway_error": "gateway_error",
-    "config_change": "gateway_error",
-    "network_issue": "bank_timeout",
-    "unresolved": "bank_timeout",
+# ── Probabilistic signal parameters ────────────────────────────────
+# Each cause produces evidence signals with controlled probabilities,
+# ensuring deliberate overlap between causes.  No single signal field
+# is a 1:1 function of the ground-truth cause.
+
+ERROR_CODE_DISTRIBUTIONS: dict[str, list[tuple[str, float]]] = {
+    "bad_deploy": [
+        ("MERCHANT_5XX", 0.50),
+        ("GATEWAY_502", 0.17),
+        ("BANK_TIMEOUT", 0.12),
+        ("ROUTE_NOT_FOUND", 0.08),
+        ("NET_CONN_RESET", 0.05),
+        ("UNKNOWN_UPSTREAM", 0.08),
+    ],
+    "bank_psp_downtime": [
+        ("PSP_UNAVAILABLE", 0.45),
+        ("BANK_TIMEOUT", 0.25),
+        ("GATEWAY_502", 0.12),
+        ("NET_CONN_RESET", 0.08),
+        ("ROUTE_NOT_FOUND", 0.05),
+        ("UNKNOWN_UPSTREAM", 0.05),
+    ],
+    "gateway_error": [
+        ("GATEWAY_502", 0.42),
+        ("BANK_TIMEOUT", 0.17),
+        ("PSP_UNAVAILABLE", 0.13),
+        ("ROUTE_NOT_FOUND", 0.08),
+        ("NET_CONN_RESET", 0.10),
+        ("UNKNOWN_UPSTREAM", 0.10),
+    ],
+    "config_change": [
+        ("ROUTE_NOT_FOUND", 0.35),
+        ("GATEWAY_502", 0.22),
+        ("MERCHANT_5XX", 0.18),
+        ("BANK_TIMEOUT", 0.10),
+        ("NET_CONN_RESET", 0.05),
+        ("UNKNOWN_UPSTREAM", 0.10),
+    ],
+    "network_issue": [
+        ("NET_CONN_RESET", 0.38),
+        ("BANK_TIMEOUT", 0.22),
+        ("GATEWAY_502", 0.13),
+        ("PSP_UNAVAILABLE", 0.08),
+        ("ROUTE_NOT_FOUND", 0.07),
+        ("UNKNOWN_UPSTREAM", 0.12),
+    ],
+}
+
+# P(signal present | cause) for each corroborating signal type.
+SIGNAL_PROBABILITIES: dict[str, dict[str, float]] = {
+    "deploy_overlap": {
+        "bad_deploy": 0.80,
+        "bank_psp_downtime": 0.12,
+        "gateway_error": 0.12,
+        "config_change": 0.12,
+        "network_issue": 0.12,
+    },
+    "config_change_overlap": {
+        "config_change": 0.75,
+        "bad_deploy": 0.10,
+        "bank_psp_downtime": 0.10,
+        "gateway_error": 0.10,
+        "network_issue": 0.10,
+    },
+    "route_health_failed": {
+        "bank_psp_downtime": 0.75,
+        "gateway_error": 0.20,
+        "network_issue": 0.15,
+        "bad_deploy": 0.05,
+        "config_change": 0.05,
+    },
+    "network_alert": {
+        "network_issue": 0.75,
+        "bank_psp_downtime": 0.15,
+        "gateway_error": 0.10,
+        "bad_deploy": 0.05,
+        "config_change": 0.05,
+    },
+    "webhook_degraded": {
+        "gateway_error": 0.65,
+        "network_issue": 0.60,
+        "bank_psp_downtime": 0.20,
+        "bad_deploy": 0.10,
+        "config_change": 0.10,
+    },
+}
+
+FAILURE_REASON_DISTRIBUTIONS: dict[str, list[tuple[str, float]]] = {
+    "bad_deploy": [
+        ("gateway_error", 0.50),
+        ("bank_timeout", 0.20),
+        ("psp_not_available", 0.15),
+        ("otp_failed", 0.10),
+        ("server_error", 0.05),
+    ],
+    "bank_psp_downtime": [
+        ("psp_not_available", 0.45),
+        ("bank_timeout", 0.25),
+        ("gateway_error", 0.20),
+        ("otp_failed", 0.10),
+    ],
+    "gateway_error": [
+        ("gateway_error", 0.50),
+        ("bank_timeout", 0.20),
+        ("psp_not_available", 0.15),
+        ("server_error", 0.10),
+        ("otp_failed", 0.05),
+    ],
+    "config_change": [
+        ("gateway_error", 0.40),
+        ("bank_timeout", 0.25),
+        ("psp_not_available", 0.20),
+        ("otp_failed", 0.15),
+    ],
+    "network_issue": [
+        ("bank_timeout", 0.45),
+        ("gateway_error", 0.25),
+        ("psp_not_available", 0.15),
+        ("otp_failed", 0.10),
+        ("server_error", 0.05),
+    ],
+    "unresolved": [
+        ("bank_timeout", 0.30),
+        ("gateway_error", 0.25),
+        ("psp_not_available", 0.20),
+        ("otp_failed", 0.15),
+        ("server_error", 0.10),
+    ],
 }
 
 
@@ -104,7 +226,11 @@ def _payment_events(
         reason = "none"
         if status == "failed":
             if window == "current":
-                reason = FAILURE_REASON_BY_CAUSE[cause]
+                dist = FAILURE_REASON_DISTRIBUTIONS.get(
+                    cause, FAILURE_REASON_DISTRIBUTIONS["unresolved"]
+                )
+                reasons, weights = zip(*dist)
+                reason = rng.choices(reasons, weights=weights, k=1)[0]
             else:
                 reason = rng.choice(["otp_failed", "bank_timeout", "gateway_error"])
 
@@ -138,6 +264,7 @@ def _signal_streams(
     severity: float,
     ambiguous: bool,
 ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    # Background deploy -- always present, never matches the target pair.
     deploy_logs = [
         {
             "source": "deploy_logs",
@@ -150,6 +277,7 @@ def _signal_streams(
             "affected_route": None,
         }
     ]
+    # Success-rate alert -- always present.
     alerts = [
         {
             "source": "alerts",
@@ -158,6 +286,7 @@ def _signal_streams(
             "timestamp": iso(alert_time),
         }
     ]
+    # Baseline webhook -- always delivered.
     webhook_events = [
         {
             "source": "webhook_events",
@@ -166,7 +295,7 @@ def _signal_streams(
             "timestamp": iso(current_start + timedelta(minutes=5)),
         }
     ]
-    error_traces = []
+    error_traces: list[dict] = []
 
     if ambiguous:
         error_traces.extend(
@@ -193,27 +322,28 @@ def _signal_streams(
         )
         return deploy_logs, alerts, webhook_events, error_traces
 
-    trace_code = {
-        "bad_deploy": "MERCHANT_5XX",
-        "bank_psp_downtime": "PSP_UNAVAILABLE",
-        "gateway_error": "GATEWAY_502",
-        "config_change": "ROUTE_NOT_FOUND",
-        "network_issue": "NET_CONN_RESET",
-    }[cause]
-    endpoint = "/v1/payments/authorize"
+    # ── Non-ambiguous: probabilistic signal generation ──────────────
+    # Each signal type is generated with a cause-dependent probability,
+    # with deliberate overlap between causes.
+
+    # Error trace -- sampled from a per-cause distribution.
+    dist = ERROR_CODE_DISTRIBUTIONS[cause]
+    codes, weights = zip(*dist)
+    error_code = rng.choices(codes, weights=weights, k=1)[0]
     error_traces.append(
         {
             "source": "error_traces",
-            "error_code": trace_code,
+            "error_code": error_code,
             "count": max(8, round(severity * 100)),
             "timestamp": iso(current_start + timedelta(minutes=3)),
-            "affected_endpoint": endpoint,
+            "affected_endpoint": "/v1/payments/authorize",
             "affected_method": target["sub_type"],
             "affected_route": target["route"],
         }
     )
 
-    if cause == "bad_deploy":
+    # Deploy overlap -- probabilistic per cause.
+    if rng.random() < SIGNAL_PROBABILITIES["deploy_overlap"][cause]:
         deploy_logs.append(
             {
                 "source": "deploy_logs",
@@ -226,7 +356,9 @@ def _signal_streams(
                 "affected_route": target["route"],
             }
         )
-    elif cause == "config_change":
+
+    # Config change overlap -- probabilistic per cause.
+    if rng.random() < SIGNAL_PROBABILITIES["config_change_overlap"][cause]:
         deploy_logs.append(
             {
                 "source": "deploy_logs",
@@ -239,7 +371,9 @@ def _signal_streams(
                 "affected_route": target["route"],
             }
         )
-    elif cause == "bank_psp_downtime":
+
+    # Route health alert -- probabilistic per cause.
+    if rng.random() < SIGNAL_PROBABILITIES["route_health_failed"][cause]:
         alerts.append(
             {
                 "source": "alerts",
@@ -248,16 +382,9 @@ def _signal_streams(
                 "timestamp": iso(current_start + timedelta(minutes=2)),
             }
         )
-    elif cause == "gateway_error":
-        webhook_events.append(
-            {
-                "source": "webhook_events",
-                "type": "payment.failed",
-                "delivery_status": "failed",
-                "timestamp": iso(current_start + timedelta(minutes=4)),
-            }
-        )
-    elif cause == "network_issue":
+
+    # Network packet-loss alert -- probabilistic per cause.
+    if rng.random() < SIGNAL_PROBABILITIES["network_alert"][cause]:
         alerts.append(
             {
                 "source": "alerts",
@@ -266,12 +393,16 @@ def _signal_streams(
                 "timestamp": iso(current_start + timedelta(minutes=1)),
             }
         )
+
+    # Webhook delivery degradation -- probabilistic per cause.
+    if rng.random() < SIGNAL_PROBABILITIES["webhook_degraded"][cause]:
+        delivery_status = rng.choice(["failed", "timed_out"])
         webhook_events.append(
             {
                 "source": "webhook_events",
                 "type": "payment.failed",
-                "delivery_status": "timed_out",
-                "timestamp": iso(current_start + timedelta(minutes=6)),
+                "delivery_status": delivery_status,
+                "timestamp": iso(current_start + timedelta(minutes=rng.choice([4, 6]))),
             }
         )
 
@@ -348,7 +479,16 @@ def generate_incident(index: int, ambiguous_indexes: set[int], seed: int = SEED)
     deploy_logs, alerts, webhook_events, error_traces = _signal_streams(
         rng, cause, target, current_start, alert_time, injected_spike, ambiguous
     )
-    top_reason = FAILURE_REASON_BY_CAUSE[cause]
+
+    current_failures = [
+        e for e in payment_events
+        if e["window"] == "current" and e["status"] == "failed"
+    ]
+    if current_failures:
+        reason_counts = Counter(e["failure_reason"] for e in current_failures)
+        top_reason = reason_counts.most_common(1)[0][0]
+    else:
+        top_reason = "none"
 
     failure_by_minute = _failure_by_minute(payment_events, current_start)
 
@@ -526,7 +666,11 @@ def build_skeptic_gate_incident(index: int, seed: int = SEED) -> dict:
                 - SKEPTIC_GATE_TARGET_BASELINE_FAILURE_RATE,
                 3,
             ),
-            "top_failure_reason": FAILURE_REASON_BY_CAUSE["bad_deploy"],
+            "top_failure_reason": Counter(
+                e["failure_reason"]
+                for e in payment_events
+                if e["window"] == "current" and e["status"] == "failed"
+            ).most_common(1)[0][0],
             "constructed_for": "skeptic_confidence_gate",
             "construction_note": (
                 "Deliberately constructed to exercise the skeptic gate: a thinly "

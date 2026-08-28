@@ -18,7 +18,11 @@ All incident events, payment attempts, and evaluation results are synthetic. The
 flowchart LR
     A[5 disconnected synthetic streams] --> B[Pair-level detector]
     B --> C[Evidence correlator]
-    C --> D[Traceable RCA]
+    C -. OPENAI_API_KEY set .-> L[OpenAI gpt-4.1-mini]
+    L --> C
+    C --> S[Skeptic adversarial review]
+    S -. OPENAI_API_KEY set .-> L
+    S --> D[Traceable RCA]
     D --> E[GMV impact calculator]
     E --> F[Bounded recovery engine]
     F --> G[Incident JSON + audit trail]
@@ -33,7 +37,7 @@ flowchart LR
 data/simulate.py   60 deterministic incidents: payments, deploys/config,
                    alerts, webhooks, and error traces; 15% ambiguous
 src/detector.py    rolling-baseline comparison per (method, route) pair
-src/correlator.py  independent evidence scoring with a 0.60 honesty gate
+src/correlator.py  LLM or rule-based root-cause diagnosis with a 0.60 honesty gate
 src/memory.py      cosine pattern recall over PRIOR incidents in the batch only
 src/rca.py         human-readable RCA using only computed evidence values
 src/impact.py      attempted, failed, recoverable, retry-recovered, and GMV-protected calculations
@@ -41,6 +45,7 @@ src/recovery.py    one primary action, hard bounds, route-health gate, audit
 src/pipeline.py    end-to-end record construction and evidence timeline
 src/evaluate.py    full-dataset metrics, exceptions, and results.json
 src/config.py      reviewable recovery policy knobs and modeling assumption
+src/llm.py         shared OpenAI client, structured JSON calls, usage tracking
 src/float_compare.py  decimal-sense comparisons for policy thresholds
 src/api.py         live incident, detail, summary, simulation, and health APIs
 src/run_demo.py    regenerate, evaluate, and serve the demo in one command
@@ -98,6 +103,57 @@ preflight correctly reports both as missing and exits non-zero with
 booting the demo once generates both.
 
 The offline dashboard remains the default and works without Razorpay credentials or network access.
+
+## LLM-Backed Reasoning Mode
+
+When an LLM API key is configured, the correlator and skeptic use real LLM
+calls for root-cause diagnosis and adversarial review. Two backends are
+supported (checked in order):
+
+1. **OpenAI** — set `OPENAI_API_KEY` (default model: `gpt-4.1-mini`)
+2. **Hugging Face Inference API** — set `HF_TOKEN` (default model:
+   `Qwen/Qwen2.5-72B-Instruct`, free tier)
+
+When neither key is present, the pipeline falls back to deterministic
+rule-based logic automatically.
+
+```bash
+# Option 1: OpenAI (the key is never logged or committed):
+OPENAI_API_KEY=sk-...
+# Option 2: Hugging Face (free, no billing required):
+HF_TOKEN=hf_...
+# Optional: override the model:
+OPENAI_MODEL=gpt-4.1-mini
+```
+
+Every pipeline record carries a `reasoning_mode` field:
+
+| Label | Meaning |
+|---|---|
+| `LLM_REASONED` | OpenAI API call succeeded; diagnosis is LLM-produced |
+| `RULE_BASED` | No API key configured; deterministic weighted scoring |
+| `RULE_BASED_FALLBACK` | API key was set but the call failed; fell back to rules |
+
+The LLM path:
+- Passes all extracted evidence (deploys, config changes, error traces, health
+  signals, network alerts, webhook status, failure concentration) as structured
+  text to the model.
+- Requests structured JSON output with `predicted_cause`, `confidence`,
+  `explanation`, and `supporting_signals`.
+- Validates the response: rejects invalid causes, enforces the 0.60 confidence
+  gate, caps confidence at 0.99.
+- The skeptic LLM receives the evidence plus the primary diagnosis and looks
+  for counter-arguments. Individual penalties are capped at 0.15, total at
+  0.50, and the hard invariant `final_confidence <= primary_confidence` is
+  enforced programmatically regardless of LLM output.
+- Timeout: 30s per call, 2 retries with automatic fallback.
+- Latency, token usage, and estimated cost are logged per call and available
+  via `src.llm.get_usage_stats()`.
+
+A fresh clone with no `OPENAI_API_KEY` produces identical results to the
+pre-LLM codebase. The 12 tests in `tests/test_llm_integration.py` verify
+fallback activation, labeling, invalid-response rejection, confidence gate
+enforcement, and skeptic invariant preservation.
 
 ## Live Demo Mode
 
@@ -161,33 +217,110 @@ curl -X POST http://127.0.0.1:8000/api/simulate \
 
 ## Full-run results
 
-These values come from the deterministic seeded run of all 61 incidents — 60 randomly
-generated (51 clear, 9 deliberately ambiguous) plus the constructed skeptic-gate case
-`INC-0061`, which is also scored as ambiguous:
+These values come from the seeded run of all 61 incidents — 60 randomly generated
+(51 clear, 9 deliberately ambiguous) plus the constructed skeptic-gate case `INC-0061`,
+which is also scored as ambiguous:
 
 | Metric | Full-dataset result |
 |---|---:|
 | Pair-level detection accuracy | 100.0% |
-| Root-cause accuracy on clear cases | 100.0% |
+| Root-cause accuracy on clear cases | **43.1%** |
 | Honesty rate on ambiguous cases | 100.0% |
-| Attempted GMV | INR 158,292,037 |
-| Failed GMV | INR 21,747,531 |
-| Recoverable GMV | INR 6,988,167 |
-| Retry-recovered amount (modeled, from retried payments) | INR 771,163 |
-| Retry-eligible incidents | 20 out of 61 total |
+| Incident escalations | 36 |
+| Misdiagnoses | 3 |
 | Recovery-rate basis | **35% modeling assumption; not measured** |
-| GMV protected (modeled, prevented future failures) | INR 9.9M–29.7M (15–45 min window; **INR 19.8M** at default 30 min) |
-| Reroute incidents | 31 out of 61 total |
-| Incident escalations | 10 |
-| Misdiagnoses | 0 |
 
-Reproduce them with `GET /api/summary` after `python -m src.run_demo`. These are the
-pure-modeled figures a fresh clone produces. Once a live test-mode recovery is
-reconciled the aggregate changes — see [Proof of live recovery mechanism](#proof-of-live-recovery-mechanism).
+### Per-cause accuracy breakdown
+
+| Root cause | Correct | Unresolved | Misdiagnosed | Accuracy |
+|---|---:|---:|---:|---:|
+| bad_deploy | 5/10 | 5 | 0 | 50% |
+| bank_psp_downtime | 5/10 | 4 | 1 | 50% |
+| gateway_error | 6/10 | 3 | 1 | 60% |
+| config_change | 2/10 | 7 | 1 | 20% |
+| network_issue | 4/11 | 7 | 0 | 36% |
+
+This is the honest accuracy of the rule-based correlator after eliminating label
+leakage from the simulator (see [Label-leakage fix](#label-leakage-fix) below).
+The correlator correctly identifies the cause ~43% of the time and honestly
+escalates to a human when it cannot resolve — it misdiagnoses in only 3 cases.
+
+### LLM-mode accuracy (Qwen 2.5 72B via Hugging Face Inference API)
+
+When an LLM backend is configured, the correlator and skeptic send all evidence
+to the model for real reasoning instead of weighted scoring.  These numbers are
+from a live run on 2026-08-28 — 61/61 incidents got `LLM_REASONED`, zero
+fallbacks:
+
+| Root cause | Correct | Unresolved | Misdiagnosed | Accuracy | vs Rule-based |
+|---|---:|---:|---:|---:|---:|
+| bad_deploy | 6/10 | 1 | 3 | 60% | +10pp |
+| bank_psp_downtime | 6/10 | 1 | 3 | 60% | +10pp |
+| gateway_error | 5/10 | 0 | 5 | 50% | -10pp |
+| config_change | 6/10 | 1 | 3 | **60%** | **+40pp** |
+| network_issue | 6/11 | 0 | 5 | **54.5%** | **+18.5pp** |
+| **Overall (clear)** | **29/51** | **3** | **19** | **56.9%** | **+13.8pp** |
+| Ambiguous honesty | 0/10 | | | 0% | -100pp |
+
+**Verdict: LLM reasoning improved overall accuracy by +13.8pp (43.1% → 56.9%).**
+The two weakest rule-based causes saw the largest gains: `config_change` jumped
+from 20% to 60% (+40pp) and `network_issue` from 36% to 54.5% (+18.5pp).
+
+**Trade-off: the LLM is overconfident.** It misdiagnoses 19 cases (vs 3 for
+rule-based) and escalates only 3 (vs 26). The rule-based path is honest about
+uncertainty — when it cannot resolve, it says `unresolved` and hands off. The LLM
+names a cause on almost every incident, and when it is wrong, it is confidently
+wrong. Ambiguous-case honesty dropped from 100% to 0%: the LLM diagnosed all 10
+ambiguous cases instead of escalating.
+
+**What this means for the demo:** LLM mode gives better accuracy when it is right,
+but the safety gate (skeptic + confidence threshold) must be strengthened before
+LLM diagnoses can drive autonomous recovery. For now, LLM reasoning is a
+diagnostic aid, not an autonomous decision-maker.
+
+| Metric | Rule-based | LLM-reasoned |
+|---|---:|---:|
+| Wall-clock time (61 incidents) | <1s | ~10 min |
+| Cost per run | $0.00 | $0.00 (HF free tier) |
+| Avg correlator latency | 0ms | 3.28s |
+| Avg skeptic latency | 0ms | 6.37s |
+| Total tokens | 0 | 78,458 |
+
+Reproduce with `GET /api/summary` after `python -m src.run_demo`. The rule-based
+figures are the pure-modeled numbers a fresh clone produces. Once a live test-mode
+recovery is reconciled the aggregate changes — see [Proof of live recovery mechanism](#proof-of-live-recovery-mechanism).
 
 Nothing is cherry-picked. Generated `results.json` contains all 61 pipeline records, their evidence and audit trails, plus the complete exception list. It is ignored by Git and regenerated on every demo boot.
 
-The previously documented miss (INC-0045, 98.3% detection / 1 misdiagnosis) was a floating-point defect, not a tuning choice. Its true success-rate drop is exactly `0.05`, but `0.97 - 0.92` evaluates to `0.04999999999999993` in binary floating point, so it fell a few ULPs under a `>= 0.05` gate and was rejected. Threshold comparisons now go through `src/float_compare.py`, which compares in decimal terms. See `tests/test_float_precision.py`.
+### Label-leakage fix
+
+The previously reported 100% root-cause accuracy was fabricated by label leakage
+in the synthetic data generator. `data/simulate.py` generated every evidence field
+as a deterministic 1:1 function of the true root cause:
+
+- **error_code**: a dict lookup `{cause: code}`, and the correlator's
+  `ERROR_SIGNATURES` was the exact inverse
+- **deploy_logs**: matching deploy events were exclusive to `bad_deploy`
+- **config_change events**: exclusive to `config_change`
+- **route_health alerts**: exclusive to `bank_psp_downtime`
+- **network_packet_loss alerts**: exclusive to `network_issue`
+- **webhook failures**: exclusive to `gateway_error`/`network_issue`
+
+The correlator was not diagnosing — it was inverting lookup tables the same code
+created. Ablation with `ERROR_SIGNATURES={}` showed the real accuracy was 60.8%
+even with all other leak channels still active.
+
+**Fix:** Every signal type now uses a probability distribution per cause with
+deliberate cross-cause overlap (e.g. `bad_deploy` produces `MERCHANT_5XX` 50%
+of the time but also `GATEWAY_502` 17%, `BANK_TIMEOUT` 12%, etc.). Every
+error code, every deploy/config/alert/webhook signal can appear for multiple
+causes. The structural regression test in `tests/test_no_label_leakage.py`
+asserts that no single evidence field achieves >85% standalone accuracy at
+predicting root cause — if the leak returns, CI catches it.
+
+The earlier float-precision fix (INC-0045, 98.3% detection) was real and is
+preserved. Threshold comparisons still go through `src/float_compare.py`.
+See `tests/test_float_precision.py`.
 
 ## Proof of live recovery mechanism
 

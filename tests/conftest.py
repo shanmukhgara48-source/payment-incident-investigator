@@ -25,6 +25,9 @@ os.environ["LIVE_API_MODE"] = "false"
 os.environ["RAZORPAY_KEY_ID"] = ""
 os.environ["RAZORPAY_KEY_SECRET"] = ""
 os.environ["RAZORPAY_WEBHOOK_SECRET"] = ""
+os.environ["OPENAI_API_KEY"] = ""
+os.environ["HF_TOKEN"] = ""
+os.environ["HUGGING_FACE_HUB_TOKEN"] = ""
 
 import pytest  # noqa: E402
 
@@ -32,3 +35,7 @@ import pytest  # noqa: E402
 @pytest.fixture(autouse=True)
 def _hermetic_razorpay_env(monkeypatch):
     monkeypatch.setattr("src.razorpay_integration.load_environment", lambda: None)
+    # Reset the LLM client cache each test so a stale cached client from a
+    # previous test (or import-time init) never leaks a real API call.
+    from src.llm import reset_client
+    reset_client()
