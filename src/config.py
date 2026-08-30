@@ -10,6 +10,32 @@ import os
 # uses the same boundary before it is willing to name a root cause.
 MIN_CONFIDENCE_FOR_AUTO_ACTION = 0.60
 
+# Stricter threshold for LLM-produced diagnoses.  LLM confidence scores are
+# less calibrated than rule-based scores derived from explicit evidence weights.
+MIN_CONFIDENCE_FOR_AUTO_ACTION_LLM = 0.65
+
+# ── Hybrid correlator: borderline band for LLM second opinion ──────
+# When rule-based confidence falls strictly inside this band, the LLM is
+# called as a tiebreaker.  Outside this band, the rule-based result stands
+# alone — no LLM call, no cost, no latency.
+#
+# The band brackets MIN_CONFIDENCE_FOR_AUTO_ACTION (0.60): incidents below
+# BORDERLINE_LOW are so weakly supported that a second opinion won't help;
+# incidents above BORDERLINE_HIGH are well-resolved and don't need one.
+# The borderline zone (0.45–0.75) is exactly where the auto-action gate
+# could flip either way and a second opinion matters most.
+RULE_BASED_BORDERLINE_LOW = 0.45
+RULE_BASED_BORDERLINE_HIGH = 0.75
+
+# When the LLM agrees with rule-based on a borderline incident, boost
+# confidence by this amount (capped at COMBINED_CONFIDENCE_CEILING).
+LLM_CORROBORATION_BOOST = 0.10
+COMBINED_CONFIDENCE_CEILING = 0.95
+
+# When the LLM disagrees, apply this penalty — two independent methods
+# disagreeing on a borderline case is strong evidence for escalation.
+LLM_CONFLICT_PENALTY = 0.15
+
 # A single payment above this amount is never included in an autonomous retry
 # or Payment Link campaign.
 MAX_AUTO_RETRY_AMOUNT_INR = 50_000

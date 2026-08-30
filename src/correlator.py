@@ -1,33 +1,57 @@
-"""Evidence-reporting root-cause correlation engine.
+"""Hybrid root-cause correlation engine: rule-based primary + LLM tiebreaker.
 
-Two diagnosis paths:
-- **LLM_REASONED**: When OPENAI_API_KEY is set, the full evidence is sent to
-  an OpenAI model for structured root-cause reasoning.
-- **RULE_BASED** / **RULE_BASED_FALLBACK**: Deterministic weighted scoring.
-  Used when no key is configured, or as automatic fallback when the LLM call
-  fails.
+The correlator always runs deterministic weighted scoring first.  When the
+rule-based confidence falls in a borderline band (configurable, default
+0.45–0.75), the LLM is called as a second opinion and results are combined:
 
-The rule-based scores are always computed and included in the evidence dict
-regardless of which path produces the final diagnosis.
+- **RULE_BASED_ALONE**: Rule-based confidence outside the borderline band.
+  No LLM call is made — the rule-based result stands as-is.
+- **RULE_BASED_LLM_CORROBORATED**: LLM agrees with the rule-based cause at
+  or above its calibrated confidence gate.  Rule-based confidence is boosted
+  by a small, capped amount.
+- **RULE_BASED_LLM_CONFLICTED**: LLM disagrees (different cause at or above
+  gate).  Rule-based confidence is penalized and the result biases toward
+  "unresolved" — two independent methods disagreeing on a borderline case
+  is exactly when escalation is correct.
+- **RULE_BASED_FALLBACK**: LLM was available but the call failed or returned
+  an invalid response.  Rule-based result is used as-is.
 """
 
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from datetime import datetime, timedelta
 
 try:
-    from .config import MIN_CONFIDENCE_FOR_AUTO_ACTION
+    from .config import (
+        COMBINED_CONFIDENCE_CEILING,
+        LLM_CONFLICT_PENALTY,
+        LLM_CORROBORATION_BOOST,
+        MIN_CONFIDENCE_FOR_AUTO_ACTION,
+        MIN_CONFIDENCE_FOR_AUTO_ACTION_LLM,
+        RULE_BASED_BORDERLINE_HIGH,
+        RULE_BASED_BORDERLINE_LOW,
+    )
     from .float_compare import gte, lt
     from .llm import llm_available, llm_call
 except ImportError:  # Supports direct imports from src/.
-    from config import MIN_CONFIDENCE_FOR_AUTO_ACTION
+    from config import (
+        COMBINED_CONFIDENCE_CEILING,
+        LLM_CONFLICT_PENALTY,
+        LLM_CORROBORATION_BOOST,
+        MIN_CONFIDENCE_FOR_AUTO_ACTION,
+        MIN_CONFIDENCE_FOR_AUTO_ACTION_LLM,
+        RULE_BASED_BORDERLINE_HIGH,
+        RULE_BASED_BORDERLINE_LOW,
+    )
     from float_compare import gte, lt
     from llm import llm_available, llm_call
 
 logger = logging.getLogger(__name__)
 
 MIN_CONFIDENCE_TO_RESOLVE = MIN_CONFIDENCE_FOR_AUTO_ACTION
+MIN_CONFIDENCE_TO_RESOLVE_LLM = MIN_CONFIDENCE_FOR_AUTO_ACTION_LLM
 
 # A resolved diagnosis must also lead the runner-up by this margin.
 MIN_MARGIN_OVER_RUNNER_UP = 0.15
@@ -62,6 +86,19 @@ Valid root causes (pick exactly one):
 - network_issue: Network-level problems (packet loss, connection resets).
 - unresolved: Evidence is insufficient or contradictory — escalate.
 
+CRITICAL CALIBRATION RULES:
+- If the evidence does not clearly and specifically support one cause over
+  plausible alternatives, you MUST respond with predicted_cause="unresolved"
+  and a confidence below 0.50.  Do not guess to be helpful.  Being wrong
+  with high confidence is WORSE than saying "unresolved".
+- Multiple weak signals that each point to DIFFERENT causes are evidence of
+  ambiguity, not evidence of any single cause.
+- A single matching signal (e.g. one error code) without corroboration from
+  an independent source (deploy log, health check, network alert) is NOT
+  sufficient to exceed 0.60 confidence.
+- Confidence 0.99 means near-certainty; reserve it for overwhelming,
+  multi-source, mutually-corroborating evidence.
+
 Respond with valid JSON:
 {
   "predicted_cause": "<one of the six values above>",
@@ -70,11 +107,38 @@ Respond with valid JSON:
   "supporting_signals": ["<signal 1>", "<signal 2>"]
 }
 
+Here are examples of correct reasoning:
+
+EXAMPLE 1 — CLEAR CASE (strong corroborating evidence → confident diagnosis):
+Evidence: Deploy merchant-checkout v8.14.1 at 100% rollout in the window,
+error code MERCHANT_5XX (merchant-side signature), route health check passed.
+Correct response: {"predicted_cause": "bad_deploy", "confidence": 0.82,
+"explanation": "100% rollout deploy overlaps the failure window and the
+dominant error is merchant-side 5XX — two independent signals corroborate.",
+"supporting_signals": ["deploy overlap at 100% rollout", "MERCHANT_5XX error signature"]}
+
+EXAMPLE 2 — AMBIGUOUS CASE (mixed signals → must say unresolved):
+Evidence: Error code GATEWAY_502 (gateway-side), but also a network packet-loss
+alert and a config change in the window.  No route health check failure.
+Correct response: {"predicted_cause": "unresolved", "confidence": 0.35,
+"explanation": "Three different signal types each point to a different cause
+(gateway_error, network_issue, config_change).  No single cause has corroborating
+independent evidence.  Escalating rather than guessing.",
+"supporting_signals": ["GATEWAY_502 trace", "network packet-loss alert", "config change overlap"]}
+
+EXAMPLE 3 — WEAK SINGLE SIGNAL (one indicator, no corroboration → unresolved):
+Evidence: Route health check failed, but error code is MERCHANT_5XX and there
+is also a deploy overlap at 10% rollout.  No network alert.
+Correct response: {"predicted_cause": "unresolved", "confidence": 0.40,
+"explanation": "Health check failure suggests bank/PSP downtime but the
+error signature and deploy overlap point to bad_deploy — contradictory signals
+with no clear winner.",
+"supporting_signals": ["route health failed", "MERCHANT_5XX", "deploy at 10%"]}
+
 Rules:
-- If confidence < 0.60 or evidence genuinely points to multiple causes
-  equally, set predicted_cause to "unresolved".
 - Do not invent evidence.  Base your reasoning only on the signals provided.
-- Confidence 0.99 means near-certainty; reserve it for overwhelming evidence.
+- When in doubt, choose "unresolved".  A human reviewer can always resolve;
+  a confident wrong diagnosis triggers autonomous recovery on the wrong path.
 """
 
 
@@ -225,13 +289,85 @@ def _try_llm_correlate(
 
     confidence = round(min(0.99, max(0.0, float(confidence))), 2)
 
-    # Enforce the same resolve gate the rule-based path uses
-    if lt(confidence, MIN_CONFIDENCE_TO_RESOLVE) and cause != "unresolved":
+    # Apply the LLM-specific confidence gate.
+    if lt(confidence, MIN_CONFIDENCE_TO_RESOLVE_LLM) and cause != "unresolved":
         cause = "unresolved"
 
     result["predicted_cause"] = cause
     result["confidence"] = confidence
     return result
+
+
+def _is_borderline(rule_confidence: float) -> bool:
+    """Return True if rule-based confidence is strictly inside the borderline band.
+
+    Strictly inside: low < confidence < high.  Values at the exact boundaries
+    are NOT borderline — the band brackets the action gate, so the edges are
+    the confident-enough and not-worth-trying zones.
+    The borderline band is a cost/latency heuristic, not a safety gate, so
+    plain float comparison is fine here (no decimal-sense needed).
+    """
+    return (
+        rule_confidence > RULE_BASED_BORDERLINE_LOW
+        and rule_confidence < RULE_BASED_BORDERLINE_HIGH
+    )
+
+
+def _combine_with_llm(
+    rule_predicted: str,
+    rule_confidence: float,
+    llm_result: dict,
+    incident_id: str,
+) -> tuple[str, float, str]:
+    """Combine rule-based and LLM results for a borderline incident.
+
+    Returns (predicted_cause, confidence, reasoning_mode).
+    """
+    llm_cause = llm_result["predicted_cause"]
+    llm_confidence = llm_result["confidence"]
+
+    # Case 3: LLM returned low-confidence or unresolved — it can't help.
+    # Apply a small penalty since even a second opinion couldn't corroborate.
+    if llm_cause == "unresolved" or lt(llm_confidence, MIN_CONFIDENCE_TO_RESOLVE_LLM):
+        penalty = 0.05
+        new_confidence = round(max(0.0, rule_confidence - penalty), 2)
+        logger.info(
+            "%s: LLM returned unresolved/low-confidence; "
+            "rule-based confidence %s → %s (-%.2f)",
+            incident_id, rule_confidence, new_confidence, penalty,
+        )
+        # If the penalty pushes below the resolve gate, mark unresolved.
+        if lt(new_confidence, MIN_CONFIDENCE_TO_RESOLVE) and rule_predicted != "unresolved":
+            return "unresolved", new_confidence, "RULE_BASED_LLM_CONFLICTED"
+        return rule_predicted, new_confidence, "RULE_BASED_LLM_CONFLICTED"
+
+    # Case 1: LLM agrees with rule-based cause — corroboration.
+    if llm_cause == rule_predicted:
+        boosted = round(
+            min(COMBINED_CONFIDENCE_CEILING, rule_confidence + LLM_CORROBORATION_BOOST),
+            2,
+        )
+        logger.info(
+            "%s: LLM corroborates rule-based (%s); "
+            "confidence %s → %s (+%.2f)",
+            incident_id, rule_predicted, rule_confidence, boosted,
+            LLM_CORROBORATION_BOOST,
+        )
+        return rule_predicted, boosted, "RULE_BASED_LLM_CORROBORATED"
+
+    # Case 2: LLM disagrees — conflict signal, bias toward escalation.
+    penalized = round(max(0.0, rule_confidence - LLM_CONFLICT_PENALTY), 2)
+    logger.info(
+        "%s: LLM disagrees (rule=%s, llm=%s); "
+        "confidence %s → %s (-%.2f)",
+        incident_id, rule_predicted, llm_cause,
+        rule_confidence, penalized, LLM_CONFLICT_PENALTY,
+    )
+    # If the penalty pushes below the resolve gate, mark unresolved —
+    # two methods disagreeing is exactly when escalation is right.
+    if lt(penalized, MIN_CONFIDENCE_TO_RESOLVE) and rule_predicted != "unresolved":
+        return "unresolved", penalized, "RULE_BASED_LLM_CONFLICTED"
+    return rule_predicted, penalized, "RULE_BASED_LLM_CONFLICTED"
 
 
 def correlate(incident: dict, detection: dict) -> dict:
@@ -243,7 +379,7 @@ def correlate(incident: dict, detection: dict) -> dict:
             "confidence": 0.0,
             "supporting_signal_count": 0,
             "evidence": {"reason": "No degradation crossed the detector threshold."},
-            "reasoning_mode": "RULE_BASED",
+            "reasoning_mode": "RULE_BASED_ALONE",
         }
 
     start = _parse_time(primary["window_start"])
@@ -251,7 +387,7 @@ def correlate(incident: dict, detection: dict) -> dict:
     method = primary["sub_type"]
     route = primary["route"]
 
-    # ── evidence extraction (unchanged) ──────────────────────────────
+    # ── evidence extraction ─────────────────────────────────────────
     overlapping_deploys = [
         event
         for event in incident["deploy_logs"]
@@ -301,7 +437,7 @@ def correlate(incident: dict, detection: dict) -> dict:
         if _in_overlap(event["timestamp"], start, end)
     )
 
-    # ── rule-based scoring (always computed, included in evidence) ────
+    # ── rule-based scoring (always runs first) ──────────────────────
     scores = {cause: 0.0 for cause in VALID_CAUSES if cause != "unresolved"}
     signals = {cause: [] for cause in scores}
 
@@ -340,9 +476,7 @@ def correlate(incident: dict, detection: dict) -> dict:
     else:
         rule_predicted = best_cause
 
-    # ── top failure reason (for LLM prompt context) ──────────────────
-    from collections import Counter
-
+    # ── top failure reason (for LLM prompt) ─────────────────────────
     failure_reasons = Counter(
         e["failure_reason"]
         for e in incident["payment_events"]
@@ -356,39 +490,55 @@ def correlate(incident: dict, detection: dict) -> dict:
     else:
         top_failure_reason, top_failure_count = "none", 0
 
-    # ── LLM diagnosis attempt ────────────────────────────────────────
-    reasoning_mode = "RULE_BASED"
-    llm_meta = None
-    llm_explanation = None
+    # ── hybrid combination ──────────────────────────────────────────
+    # Start with rule-based result as the primary.
     predicted_cause = rule_predicted
     confidence = rule_confidence
+    reasoning_mode = "RULE_BASED_ALONE"
+    llm_meta = None
+    llm_explanation = None
+    llm_second_opinion = None  # Track what the LLM said for the evidence dict
 
-    llm_result = _try_llm_correlate(
-        incident,
-        primary,
-        overlapping_deploys,
-        config_changes,
-        dominant_trace,
-        signature,
-        concentration,
-        route_health_failed,
-        route_health_confirmed,
-        network_alert,
-        webhook_failed,
-        top_failure_reason,
-        top_failure_count,
-    )
+    borderline = _is_borderline(rule_confidence)
 
-    if llm_result is not None:
-        predicted_cause = llm_result["predicted_cause"]
-        confidence = llm_result["confidence"]
-        llm_explanation = llm_result.get("explanation", "")
-        llm_meta = llm_result.get("_llm_meta")
-        reasoning_mode = "LLM_REASONED"
-    elif llm_available():
-        reasoning_mode = "RULE_BASED_FALLBACK"
+    if borderline and llm_available():
+        llm_result = _try_llm_correlate(
+            incident,
+            primary,
+            overlapping_deploys,
+            config_changes,
+            dominant_trace,
+            signature,
+            concentration,
+            route_health_failed,
+            route_health_confirmed,
+            network_alert,
+            webhook_failed,
+            top_failure_reason,
+            top_failure_count,
+        )
 
-    # ── build result ─────────────────────────────────────────────────
+        if llm_result is not None:
+            llm_meta = llm_result.get("_llm_meta")
+            llm_explanation = llm_result.get("explanation", "")
+            llm_second_opinion = {
+                "cause": llm_result["predicted_cause"],
+                "confidence": llm_result["confidence"],
+            }
+            predicted_cause, confidence, reasoning_mode = _combine_with_llm(
+                rule_predicted,
+                rule_confidence,
+                llm_result,
+                incident["incident_id"],
+            )
+        elif llm_available():
+            # LLM call failed — fall back to rule-based as-is.
+            reasoning_mode = "RULE_BASED_FALLBACK"
+    elif borderline and not llm_available():
+        # No LLM configured — rule-based stands alone.
+        pass
+
+    # ── build result ────────────────────────────────────────────────
     deploy = overlapping_deploys[0] if overlapping_deploys else None
     config = config_changes[0] if config_changes else None
     evidence = {
@@ -421,24 +571,21 @@ def correlate(incident: dict, detection: dict) -> dict:
             f"resolve only at >= {MIN_CONFIDENCE_TO_RESOLVE:.2f} "
             f"with >= {MIN_MARGIN_OVER_RUNNER_UP:.2f} lead"
         ),
-        "supporting_signals": (
-            llm_result.get("supporting_signals", signals[best_cause])
-            if llm_result is not None
-            else signals[best_cause]
-        ),
+        "supporting_signals": signals[best_cause],
+        "rule_based_confidence": rule_confidence,
+        "rule_based_predicted_cause": rule_predicted,
+        "borderline": borderline,
     }
     if llm_explanation:
         evidence["llm_explanation"] = llm_explanation
+    if llm_second_opinion:
+        evidence["llm_second_opinion"] = llm_second_opinion
 
     result = {
         "incident_id": incident["incident_id"],
         "predicted_cause": predicted_cause,
         "confidence": confidence,
-        "supporting_signal_count": (
-            len(evidence["supporting_signals"])
-            if evidence["supporting_signals"]
-            else len(signals[best_cause])
-        ),
+        "supporting_signal_count": len(evidence["supporting_signals"]),
         "evidence": evidence,
         "reasoning_mode": reasoning_mode,
     }

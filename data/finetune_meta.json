@@ -1,0 +1,39 @@
+{
+  "total": 301,
+  "train": {
+    "count": 212,
+    "causes": {
+      "config_change": 36,
+      "gateway_error": 36,
+      "unresolved": 32,
+      "network_issue": 36,
+      "bank_psp_downtime": 36,
+      "bad_deploy": 36
+    }
+  },
+  "val": {
+    "count": 47,
+    "causes": {
+      "network_issue": 8,
+      "gateway_error": 8,
+      "bank_psp_downtime": 8,
+      "unresolved": 7,
+      "bad_deploy": 8,
+      "config_change": 8
+    }
+  },
+  "test": {
+    "count": 42,
+    "causes": {
+      "unresolved": 7,
+      "network_issue": 7,
+      "config_change": 7,
+      "bank_psp_downtime": 7,
+      "gateway_error": 7,
+      "bad_deploy": 7
+    }
+  },
+  "overlap_check": "PASS",
+  "seed": 20260827,
+  "generated_count": 300
+}

@@ -272,6 +272,13 @@ def _try_llm_skeptic(
         logger.warning("LLM skeptic returned non-list challenges; falling back")
         return None
 
+    # Penalty caps.  In the hybrid correlator, the primary is always rule-based
+    # (potentially adjusted by LLM corroboration/conflict), so standard caps
+    # apply.  The LLM-specific overconfidence is handled inside the correlator's
+    # combination logic, not here.
+    max_individual_penalty = 0.15
+    max_total_penalty = 0.50
+
     validated_challenges = []
     total_penalty = 0.0
     for ch in challenges:
@@ -280,7 +287,7 @@ def _try_llm_skeptic(
         penalty = ch.get("penalty", 0)
         if not isinstance(penalty, (int, float)) or penalty < 0:
             continue
-        penalty = min(float(penalty), 0.15)  # cap individual penalties
+        penalty = min(float(penalty), max_individual_penalty)
         validated_challenges.append({
             "rule": str(ch.get("rule", "llm_challenge")),
             "fired": True,
@@ -289,7 +296,7 @@ def _try_llm_skeptic(
         })
         total_penalty += penalty
 
-    total_penalty = round(min(total_penalty, 0.50), 3)  # cap total
+    total_penalty = round(min(total_penalty, max_total_penalty), 3)
     final_confidence = round(max(0.0, primary_confidence - total_penalty), 2)
 
     # Hard invariant: skeptic can only hold or lower confidence.

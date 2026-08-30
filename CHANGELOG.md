@@ -1,71 +1,125 @@
 # Changelog
 
-## OpenAI LLM Reasoning Integration - 2026-08-28
+## Hybrid Correlator Architecture - 2026-08-28
 
-### What was added
+### The problem
 
-Wired real OpenAI API calls into the correlator and skeptic stages, replacing
-the pure rule-based diagnosis path with LLM-backed reasoning when
-`OPENAI_API_KEY` is configured.
+Three experiments revealed a fundamental tradeoff in LLM-based diagnosis:
 
-- **`src/llm.py`** — shared OpenAI client module with lazy initialization,
-  structured JSON calls, automatic retry (2 attempts, 30s timeout), and
-  cumulative usage/cost tracking.
-- **`src/correlator.py`** — when LLM is available, sends all extracted evidence
-  (deploys, config changes, error traces, health signals, network alerts,
-  webhook status, failure concentration) to `gpt-4.1-mini` and asks for a
-  structured root-cause diagnosis. Validates the response against `VALID_CAUSES`,
-  enforces the 0.60 confidence gate, and falls back to rule-based scoring on
-  any failure.
-- **`src/skeptic.py`** — when LLM is available, sends evidence plus the primary
-  diagnosis to the model for adversarial review. Individual penalties capped at
-  0.15, total at 0.50. The hard invariant `final_confidence <= primary_confidence`
-  is enforced programmatically regardless of LLM output.
-- Every pipeline record carries a `reasoning_mode` field: `LLM_REASONED`,
-  `RULE_BASED`, or `RULE_BASED_FALLBACK`.
-- Rule-based scores are always computed and included in the evidence dict,
-  regardless of which path produces the final diagnosis.
+| Configuration | Accuracy | Honesty | Misdiagnoses |
+|---|---:|---:|---:|
+| Pure rule-based | 43.1% | 100% | 3 |
+| Pure LLM (uncalibrated) | 56.9% | 0% | 19 |
+| Pure LLM (calibrated) | 31.4% | 100% | 10 |
 
-### Fallback guarantee
+The uncalibrated LLM looked accurate but was dangerously overconfident — 0%
+honesty on ambiguous cases and 19 misdiagnoses.  Calibrating the prompt fixed
+honesty but dropped accuracy below rule-based (31.4% vs 43.1%) and still had
+10 misdiagnoses.  Neither pure approach was acceptable.
 
-A fresh clone with no `OPENAI_API_KEY` produces identical results to the
-pre-LLM codebase. If the API key is set but a call fails (timeout, rate limit,
-invalid response, network error), the pipeline falls back automatically and
-labels the output `RULE_BASED_FALLBACK`.
+### Why hybrid
+
+Rules are reliable and calibrated but plateau at 43.1%.  The LLM has genuine
+diagnostic insight (e.g. `bank_psp_downtime` 60% vs 50%) but cannot be trusted
+as the primary decision-maker.  The hybrid uses rules as the primary diagnosis
+and calls the LLM only as a second opinion on borderline cases — preserving
+rule-based reliability while giving the LLM a bounded opportunity to help.
+
+### How it works
+
+1. **Rule-based scoring runs first** on every incident — unchanged from baseline.
+2. **Borderline band** (`src/config.py`): if rule confidence is strictly inside
+   (0.45, 0.75), the case is borderline.  This band brackets the 0.60
+   auto-action gate, so these are exactly the cases where a second opinion
+   matters most.
+3. **LLM second opinion** (`src/correlator.py`): only called for borderline
+   cases when an API key is configured.  Uses a calibrated prompt with
+   uncertainty instructions and three few-shot examples.
+4. **Combination logic** (`_combine_with_llm()`):
+   - **CORROBORATED**: LLM agrees with rules → +0.10 confidence boost (capped
+     at 0.95)
+   - **CONFLICTED**: LLM disagrees → −0.15 confidence penalty (rules win on
+     cause)
+   - **FALLBACK**: LLM call failed → rule result unchanged
+5. **Skeptic review** runs after, with standard penalty caps (0.15/0.50) for
+   all modes — the hybrid handles LLM overconfidence internally.
+
+### Four-way results
+
+All runs: 61 incidents, Qwen/Qwen2.5-72B-Instruct via Hugging Face free tier.
+
+| Metric | Rules | LLM uncalib | LLM calib | Hybrid |
+|---|---:|---:|---:|---:|
+| Overall accuracy | 43.1% | 56.9% | 31.4% | **43.1%** |
+| Ambiguous honesty | 100% | 0% | 100% | **100%** |
+| Misdiagnoses | 3 | 19 | 10 | **3** |
+| LLM calls | 0 | 61 | 61 | **27** |
+| Wall time | ~2s | ~17min | ~17min | **~4min** |
+| Tokens | 0 | ~104k | ~104k | **~48k** |
+
+The hybrid matches rule-based accuracy and honesty exactly (43.1%, 100%, 3
+misdiagnoses) while reducing LLM calls by 56% (61 → 27) and wall time by 76%.
+Of the 27 borderline cases where the LLM was consulted, all 27 disagreed with
+rules (CONFLICTED) — the LLM did not corroborate any borderline diagnosis in
+this dataset.  This is consistent with the LLM's tendency toward overconfidence
+on ambiguous evidence.
+
+### Hard invariants (tested)
+
+- Conflict never raises confidence above the rule-based value
+- Corroboration never exceeds the 0.95 ceiling
+- Non-borderline cases are never sent to the LLM
+- Skeptic always runs regardless of reasoning mode
+- `final_confidence <= primary_confidence` (skeptic monotonicity)
 
 ### Test coverage
 
-`tests/test_llm_integration.py` (12 tests) covers:
-- Rule-based labeling when no key is set
-- Fallback activation when LLM calls fail
-- Rejection of invalid LLM responses (unknown cause)
-- Acceptance of valid LLM responses
-- Confidence gate enforcement on LLM output
-- Skeptic invariant preservation (confidence clamp, penalty caps)
+`tests/test_llm_integration.py` rewritten with 8 test classes, ~25 tests:
+- Borderline band boundaries (7 tests): exact edges, action gate inside band
+- Hybrid corroboration: boost on agreement, ceiling cap
+- Hybrid conflict: penalty on disagreement, invariant that conflict never raises
+- Hard invariants (4 tests): ceiling, non-borderline identity, no-LLM-call for
+  non-borderline, skeptic still runs
+- LLM fallback on failure/invalid response (2 tests)
+- Overconfidence regression (3 tests): gate verification at 0.65
 
-### Hugging Face Inference API support
+### Configuration
 
-Added as a second backend when OpenAI credits are unavailable.  `src/llm.py`
-checks `OPENAI_API_KEY` first, then `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN`.
-The HF path uses the OpenAI-compatible `router.huggingface.co/v1/` endpoint
-with `Qwen/Qwen2.5-72B-Instruct` as the default model (free tier).
+| Constant | Value | Purpose |
+|---|---|---|
+| `RULE_BASED_BORDERLINE_LOW` | 0.45 | Lower edge of borderline band |
+| `RULE_BASED_BORDERLINE_HIGH` | 0.75 | Upper edge of borderline band |
+| `LLM_CORROBORATION_BOOST` | 0.10 | Confidence boost when LLM agrees |
+| `LLM_CONFLICT_PENALTY` | 0.15 | Confidence penalty when LLM disagrees |
+| `COMBINED_CONFIDENCE_CEILING` | 0.95 | Max confidence after corroboration |
+| `MIN_CONFIDENCE_FOR_AUTO_ACTION` | 0.60 | Auto-action gate (all modes) |
 
-### Live evaluation results (2026-08-28)
+### Reasoning modes
 
-61/61 incidents got `LLM_REASONED` via Qwen 2.5 72B on Hugging Face:
+| Mode | Meaning |
+|---|---|
+| `RULE_BASED_ALONE` | Confidence outside borderline band; LLM not consulted |
+| `RULE_BASED_LLM_CORROBORATED` | LLM agreed with rule-based diagnosis |
+| `RULE_BASED_LLM_CONFLICTED` | LLM disagreed; rules win, confidence penalized |
+| `RULE_BASED_FALLBACK` | LLM call failed; rule result unchanged |
 
-| Metric | Rule-based | LLM | Delta |
-|---|---:|---:|---:|
-| Overall accuracy | 43.1% | 56.9% | +13.8pp |
-| config_change | 20% | 60% | +40pp |
-| network_issue | 36% | 54.5% | +18.5pp |
-| Misdiagnoses | 3 | 19 | +16 |
-| Ambiguous honesty | 100% | 0% | -100pp |
+## LLM Backend and Evaluation Infrastructure - 2026-08-28
 
-LLM reasoning adds genuine diagnostic value (+13.8pp overall), especially on
-weak-signal causes.  But it is overconfident: 19 misdiagnoses vs 3, and it
-never escalates ambiguous cases.  The rule-based path is the safer autonomous
-decision-maker until the LLM's confidence calibration is addressed.
+### What was added
+
+- **`src/llm.py`** — shared OpenAI-compatible client module with lazy
+  initialization, structured JSON calls, automatic retry (2 attempts, 120s
+  timeout), and cumulative usage/cost tracking.  Supports OpenAI and Hugging
+  Face Inference API backends.
+- **`src/evaluate_llm.py`** — live evaluation harness that runs the full
+  pipeline with LLM enabled, reports per-cause accuracy, reasoning mode
+  breakdown, cost/latency, and saves results to `data/llm_evaluation.json`.
+
+### Fallback guarantee
+
+A fresh clone with no API key produces identical results to the pre-LLM
+codebase. If a key is set but a call fails, the pipeline falls back
+automatically and labels the output `RULE_BASED_FALLBACK`.
 
 ### Configuration
 

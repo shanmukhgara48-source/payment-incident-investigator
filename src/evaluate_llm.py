@@ -61,7 +61,8 @@ def main() -> None:
     print()
 
     # === Reasoning mode breakdown ===
-    correlator_modes = Counter(r["correlation"]["reasoning_mode"] for r in records)
+    # Use primary_diagnosis for the pre-skeptic correlator mode
+    correlator_modes = Counter(r["primary_diagnosis"]["reasoning_mode"] for r in records)
     skeptic_modes = Counter(r["skeptic_review"]["reasoning_mode"] for r in records)
     print("=== REASONING MODE BREAKDOWN ===")
     print(f"Correlator: {dict(correlator_modes)}")

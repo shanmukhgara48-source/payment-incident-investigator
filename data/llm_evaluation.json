@@ -1,0 +1,31 @@
+{
+  "overall_accuracy_pct": 43.1,
+  "per_cause": {
+    "bad_deploy": 50.0,
+    "bank_psp_downtime": 50.0,
+    "gateway_error": 60.0,
+    "config_change": 20.0,
+    "network_issue": 36.36363636363637
+  },
+  "misdiagnosed": 3,
+  "unresolved": 26,
+  "ambiguous_honesty_pct": 100.0,
+  "correlator_modes": {
+    "RULE_BASED_ALONE": 34,
+    "RULE_BASED_LLM_CONFLICTED": 27
+  },
+  "skeptic_modes": {
+    "LLM_REASONED": 25,
+    "RULE_BASED_FALLBACK": 36
+  },
+  "cost": {
+    "total_calls": 52,
+    "total_prompt_tokens": 40360,
+    "total_completion_tokens": 7592,
+    "total_latency_seconds": 238.6901141240669,
+    "model": "Qwen/Qwen2.5-72B-Instruct",
+    "backend": "huggingface",
+    "estimated_cost_usd": 0.0
+  },
+  "wall_time_seconds": 241.6
+}

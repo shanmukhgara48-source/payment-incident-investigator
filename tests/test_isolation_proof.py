@@ -46,12 +46,12 @@ class TestZeroRealAPICalls(unittest.TestCase):
         self.assertEqual(stats["total_prompt_tokens"], 0)
         self.assertEqual(stats["total_completion_tokens"], 0)
 
-        # Every record should be RULE_BASED (not FALLBACK, not LLM_REASONED)
+        # Every record should be rule-based-only (not FALLBACK, not LLM-involved)
         for rec in records:
-            self.assertEqual(
+            self.assertIn(
                 rec["correlation"]["reasoning_mode"],
-                "RULE_BASED",
-                f"{rec['incident_id']} correlation was not RULE_BASED",
+                {"RULE_BASED", "RULE_BASED_ALONE"},
+                f"{rec['incident_id']} correlation used LLM unexpectedly",
             )
             self.assertEqual(
                 rec["skeptic_review"]["reasoning_mode"],

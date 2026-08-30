@@ -317,7 +317,9 @@ def run_incident(incident: dict, memory: IncidentMemory | None = None) -> dict:
     # Build an adjusted correlation with final_confidence for downstream stages.
     # The original correlation is preserved as primary_diagnosis in the record.
     adjusted_correlation = {**correlation, "confidence": skeptic["final_confidence"]}
-    # If skeptic lowered confidence below the resolve threshold, mark unresolved
+    # If skeptic lowered confidence below the resolve threshold, mark unresolved.
+    # The hybrid correlator uses the standard rule-based gate (0.60) since its
+    # combination logic already applies the LLM-specific gate internally.
     if (
         lt(adjusted_correlation["confidence"], MIN_CONFIDENCE_FOR_AUTO_ACTION)
         and correlation["predicted_cause"] != "unresolved"

@@ -27,7 +27,7 @@ DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
 DEFAULT_HF_MODEL = "Qwen/Qwen2.5-72B-Instruct"
 HF_BASE_URL = "https://router.huggingface.co/v1/"
 
-LLM_TIMEOUT_SECONDS = 30
+LLM_TIMEOUT_SECONDS = 120
 LLM_MAX_RETRIES = 2
 
 # Module-level cached client (lazy init).
